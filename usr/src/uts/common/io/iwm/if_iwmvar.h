@@ -144,6 +144,8 @@ struct iwm_dma_info {
 	caddr_t		vaddr;
 	size_t		length;
 	size_t		size;
+	boolean_t	allocated;
+	boolean_t	memory;
 	boolean_t	bound;
 };
 
@@ -189,8 +191,11 @@ struct iwm_cfg {
 	uint_t		family;
 	size_t		fw_dma_size;
 	size_t		nvm_section_size;
+	boolean_t	nvm_external;
 	const char	*fwname;
 };
+
+#define	IWM_PASSIVE_DMA_COUNT	4
 
 struct iwm_softc {
 	dev_info_t		*dip;
@@ -202,15 +207,35 @@ struct iwm_softc {
 	off_t			regsize;
 	ddi_intr_handle_t	intr;
 	uint_t			intr_pri;
+	int			intr_types;
+	int			intr_cap;
+	boolean_t		intr_allocated;
+	boolean_t		intr_added;
+	boolean_t		intr_enabled;
+	boolean_t		lock_initialized;
+	boolean_t		csr_valid;
+	boolean_t		attached;
+	boolean_t		intr_fault;
+	uint32_t		intr_calls;
+	uint32_t		hw_rev;
+	uint32_t		gp_cntrl;
+	uint16_t		pci_command;
+	uint16_t		pcie_cap;
+	uint16_t		msi_cap;
+	uint16_t		pm_cap;
+	int			fail_step;
+	int			attach_step;
 	kmutex_t		lock;
+	struct iwm_dma_info	dma[IWM_PASSIVE_DMA_COUNT];
 	struct iwm_fw_info	fw;
 };
 
 /*
- * These native transport helpers are not called by attach.  Their caller
- * must hold exclusive lifecycle ownership, run in thread context and have
- * stopped device DMA before releasing mappings.  No sleeping allocation may
- * run under an interrupt mutex.  No MAC/net80211 callbacks are registered.
+ * Attach/detach own resources exclusively in thread context.  No DMA address
+ * is ever published.  The interrupt lock protects only handler observations;
+ * allocation, DDI interrupt operations and cleanup run without that lock.
+ * Disable/remove the handler before destroying its lock or BAR.  Firmware
+ * helpers remain unreachable from every driver entry point.
  */
 int iwm_pci_map(struct iwm_softc *);
 void iwm_pci_unmap(struct iwm_softc *);

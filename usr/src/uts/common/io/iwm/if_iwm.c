@@ -20,10 +20,9 @@
  * the accompanying headers.  This file contains native illumos integration,
  * not an implementation of OpenBSD kernel interfaces.
  *
- * Attachment is deliberately rejected before PCI access.  There is no
- * hardware start, firmware transfer, interrupt handler or MAC registration.
- * The resource helpers below are compiled for API checking, but have no
- * caller on the module's entry-point paths.  They are not a hardware test.
+ * Passive attachment only: no NIC start, firmware operation, DMA publication
+ * or MAC registration.  Device interrupt causes stay masked.  One MSI host
+ * handle is enabled briefly, then disabled before attach completes.
  */
 
 #include <sys/types.h>
@@ -31,11 +30,13 @@
 #include <sys/modctl.h>
 #include <sys/ddi.h>
 #include <sys/sunddi.h>
+#include <sys/sunndi.h>
 #include <sys/pci.h>
 #include <sys/errno.h>
 #include <sys/kmem.h>
 #include <sys/firmload.h>
 #include <sys/mac_provider.h>
+#include <sys/atomic.h>
 #include "if_iwmvar.h"
 
 /* The only hardware identity admitted by the resource mapping helper. */
@@ -48,6 +49,7 @@ static const struct iwm_cfg iwm_8260 = {
 	.family = IWM_DEVICE_FAMILY_8000,
 	.fw_dma_size = IWM_FWDMASEGSZ_8000,
 	.nvm_section_size = 32768,
+	.nvm_external = B_TRUE,
 	.fwname = "iwm-8000C-36"
 };
 
@@ -56,6 +58,33 @@ static const struct iwm_cfg iwm_8260 = {
 #define	IWM_FW_FILE_MAX	(4 * 1024 * 1024)
 
 static void *iwm_state;
+static uint32_t iwm_retained;
+
+static int iwm_checkpoint(struct iwm_softc *, const char *);
+static int iwm_cleanup(struct iwm_softc *);
+
+/* Only recognised causes may be acknowledged by the dormant handler. */
+#define	IWM_PASSIVE_INT_CAUSES	(IWM_CSR_INT_BIT_FH_RX | \
+	IWM_CSR_INT_BIT_HW_ERR | IWM_CSR_INT_BIT_RX_PERIODIC | \
+	IWM_CSR_INT_BIT_FH_TX | IWM_CSR_INT_BIT_SCD | IWM_CSR_INT_BIT_SW_ERR | \
+	IWM_CSR_INT_BIT_RF_KILL | IWM_CSR_INT_BIT_CT_KILL | \
+	IWM_CSR_INT_BIT_SW_RX | IWM_CSR_INT_BIT_WAKEUP | IWM_CSR_INT_BIT_ALIVE)
+#define	IWM_PASSIVE_FH_CAUSES	(IWM_CSR_FH_INT_BIT_ERR | \
+	IWM_CSR_FH_INT_BIT_HI_PRIOR | IWM_CSR_FH_INT_BIT_RX_CHNL1 | \
+	IWM_CSR_FH_INT_BIT_RX_CHNL0 | IWM_CSR_FH_INT_BIT_TX_CHNL1 | \
+	IWM_CSR_FH_INT_BIT_TX_CHNL0)
+
+/* Real future control objects, allocated but never published to the NIC. */
+static const struct {
+	const char *name;
+	size_t size;
+	uint_t align;
+} iwm_passive_dma[IWM_PASSIVE_DMA_COUNT] = {
+	{ "keep-warm", 4096, 4096 },
+	{ "tx-descriptors", IWM_TX_RING_COUNT * sizeof (struct iwm_tfd), 256 },
+	{ "rx-descriptors", IWM_RX_RING_COUNT * sizeof (uint32_t), 256 },
+	{ "rx-status", sizeof (struct iwm_rb_status), 16 }
+};
 
 static const ddi_device_acc_attr_t iwm_reg_attr = {
 	DDI_DEVICE_ATTR_V0, DDI_STRUCTURE_LE_ACC, DDI_STRICTORDER_ACC,
@@ -68,6 +97,66 @@ static const ddi_device_acc_attr_t iwm_dma_attr = {
 	DDI_DEFAULT_ACC
 };
 
+/* Inject test failure after a successful ownership transition. */
+static int
+iwm_checkpoint(struct iwm_softc *sc, const char *name)
+{
+	if (++sc->attach_step != sc->fail_step)
+		return (0);
+	dev_err(sc->dip, CE_NOTE, "!iwm injected failure %d (%s)",
+	    sc->attach_step, name);
+	return (EIO);
+}
+
+/* A bounded conventional PCI capability walk, including cycle detection. */
+static int
+iwm_pci_caps(struct iwm_softc *sc)
+{
+	uint64_t seen = 0;
+	uint8_t ptr, id;
+	uint16_t pmcsr, msi;
+
+	if (!(pci_config_get16(sc->pcih, PCI_CONF_STAT) & PCI_STAT_CAP))
+		return (ENOTSUP);
+	ptr = pci_config_get8(sc->pcih, PCI_CONF_CAP_PTR);
+	while (ptr != 0) {
+		if (ptr < 0x40 || (ptr & 3) != 0 ||
+		    (seen & (1ULL << (ptr / 4))) != 0)
+			return (EIO);
+		seen |= 1ULL << (ptr / 4);
+		id = pci_config_get8(sc->pcih, ptr);
+		switch (id) {
+		case PCI_CAP_ID_PCI_E:
+			sc->pcie_cap = ptr;
+			break;
+		case PCI_CAP_ID_MSI:
+			sc->msi_cap = ptr;
+			break;
+		case PCI_CAP_ID_PM:
+			if (ptr > 0xf8)
+				return (EIO);
+			sc->pm_cap = ptr;
+			break;
+		case 0xff:
+			return (EIO);
+		default:
+			break;
+		}
+		ptr = pci_config_get8(sc->pcih, ptr + PCI_CAP_NEXT_PTR);
+	}
+	if (sc->pcie_cap == 0 || sc->msi_cap == 0 || sc->pm_cap == 0)
+		return (ENOTSUP);
+	pmcsr = pci_config_get16(sc->pcih, sc->pm_cap + PCI_PMCSR);
+	msi = pci_config_get16(sc->pcih, sc->msi_cap + PCI_MSI_CTRL);
+	dev_err(sc->dip, CE_NOTE, "!iwm caps PCIe=%02x MSI=%02x PM=%02x "
+	    "PMCSR=%04x MSI-control=%04x", sc->pcie_cap, sc->msi_cap,
+	    sc->pm_cap, pmcsr, msi);
+	if ((pmcsr & PCI_PMCSR_STATE_MASK) != PCI_PMCSR_D0 ||
+	    (msi & PCI_MSI_ENABLE_BIT) != 0)
+		return (EBUSY);
+	return (0);
+}
+
 /*
  * Thread context, exclusive lifecycle ownership.  This does not enable bus
  * mastering, alter PCI command bits, or read/write the mapped device BAR.
@@ -77,29 +166,39 @@ int
 iwm_pci_map(struct iwm_softc *sc)
 {
 	const struct iwm_cfg *cfg = &iwm_8260;
+	uint16_t vendor, device, subvendor, subdevice;
+	uint8_t revision;
 
 	if (sc->pcih != NULL || sc->regh != NULL)
 		return (EBUSY);
 	if (pci_config_setup(sc->dip, &sc->pcih) != DDI_SUCCESS)
 		return (EIO);
-
-	if (pci_config_get16(sc->pcih, PCI_CONF_VENID) != cfg->vendor ||
-	    pci_config_get16(sc->pcih, PCI_CONF_DEVID) != cfg->device ||
-	    pci_config_get16(sc->pcih, PCI_CONF_SUBVENID) != cfg->subvendor ||
-	    pci_config_get16(sc->pcih, PCI_CONF_SUBSYSID) != cfg->subdevice ||
-	    pci_config_get8(sc->pcih, PCI_CONF_REVID) != cfg->revision) {
-		iwm_pci_unmap(sc);
+	if (iwm_checkpoint(sc, "pci-config") != 0)
+		return (EIO);
+	vendor = pci_config_get16(sc->pcih, PCI_CONF_VENID);
+	device = pci_config_get16(sc->pcih, PCI_CONF_DEVID);
+	subvendor = pci_config_get16(sc->pcih, PCI_CONF_SUBVENID);
+	subdevice = pci_config_get16(sc->pcih, PCI_CONF_SUBSYSID);
+	revision = pci_config_get8(sc->pcih, PCI_CONF_REVID);
+	dev_err(sc->dip, CE_NOTE, "!iwm PCI %04x:%04x subsystem %04x:%04x "
+	    "revision %02x", vendor, device, subvendor, subdevice, revision);
+	if (vendor != cfg->vendor || device != cfg->device ||
+	    subvendor != cfg->subvendor || subdevice != cfg->subdevice ||
+	    revision != cfg->revision)
 		return (ENODEV);
-	}
+	sc->pci_command = pci_config_get16(sc->pcih, PCI_CONF_COMM);
+	dev_err(sc->dip, CE_NOTE, "!iwm PCI command before=%04x",
+	    sc->pci_command);
+	/* Preserve power, memory decoding, retry timeout and bus mastering. */
+	if (!(sc->pci_command & PCI_COMM_MAE) || iwm_pci_caps(sc) != 0)
+		return (ENOTSUP);
 	if (ddi_dev_regsize(sc->dip, 1, &sc->regsize) != DDI_SUCCESS ||
 	    sc->regsize != IWM_BAR_SIZE ||
 	    ddi_regs_map_setup(sc->dip, 1, &sc->regs, 0, sc->regsize,
-	    &iwm_reg_attr, &sc->regh) != DDI_SUCCESS) {
-		iwm_pci_unmap(sc);
+	    &iwm_reg_attr, &sc->regh) != DDI_SUCCESS)
 		return (EIO);
-	}
 	sc->cfg = cfg;
-	return (0);
+	return (iwm_checkpoint(sc, "bar"));
 }
 
 void
@@ -154,7 +253,7 @@ iwm_dma_alloc(struct iwm_softc *sc, struct iwm_dma_info *dma, size_t size,
 	};
 	uint_t count;
 
-	if (dma->dma_hdl != NULL || dma->acc_hdl != NULL || dma->bound)
+	if (dma->allocated || dma->memory || dma->bound)
 		return (EBUSY);
 	if (size == 0 || size > IWM_DMA_MAX || align == 0 ||
 	    (align & (align - 1)) != 0 ||
@@ -165,9 +264,15 @@ iwm_dma_alloc(struct iwm_softc *sc, struct iwm_dma_info *dma, size_t size,
 	if (ddi_dma_alloc_handle(sc->dip, &attr, DDI_DMA_SLEEP, NULL,
 	    &dma->dma_hdl) != DDI_SUCCESS)
 		return (ENOMEM);
+	dma->allocated = B_TRUE;
+	if (iwm_checkpoint(sc, "dma-handle") != 0)
+		goto fail;
 	if (ddi_dma_mem_alloc(dma->dma_hdl, size, &iwm_dma_attr,
 	    DDI_DMA_CONSISTENT, DDI_DMA_SLEEP, NULL, &dma->vaddr,
 	    &dma->length, &dma->acc_hdl) != DDI_SUCCESS)
+		goto fail;
+	dma->memory = B_TRUE;
+	if (iwm_checkpoint(sc, "dma-memory") != 0)
 		goto fail;
 	if (dma->length < size)
 		goto fail;
@@ -176,6 +281,8 @@ iwm_dma_alloc(struct iwm_softc *sc, struct iwm_dma_info *dma, size_t size,
 	    &dma->cookie, &count) != DDI_DMA_MAPPED)
 		goto fail;
 	dma->bound = B_TRUE;
+	if (iwm_checkpoint(sc, "dma-bind") != 0)
+		goto fail;
 	if (count != 1 || dma->cookie.dmac_size < size ||
 	    dma->cookie.dmac_laddress > IWM_DMA_MAX ||
 	    size - 1 > IWM_DMA_MAX - dma->cookie.dmac_laddress ||
@@ -183,6 +290,12 @@ iwm_dma_alloc(struct iwm_softc *sc, struct iwm_dma_info *dma, size_t size,
 		goto fail;
 	dma->size = size;
 	bzero(dma->vaddr, size);
+	/* Exercise both sync directions without publishing the cookie. */
+	if (ddi_dma_sync(dma->dma_hdl, 0, size, DDI_DMA_SYNC_FORDEV) !=
+	    DDI_SUCCESS || ddi_dma_sync(dma->dma_hdl, 0, size,
+	    DDI_DMA_SYNC_FORCPU) != DDI_SUCCESS ||
+	    iwm_checkpoint(sc, "dma-sync") != 0)
+		goto fail;
 	return (0);
 
 fail:
@@ -200,9 +313,9 @@ iwm_dma_free(struct iwm_dma_info *dma)
 			return (EIO);
 		dma->bound = B_FALSE;
 	}
-	if (dma->acc_hdl != NULL)
+	if (dma->memory)
 		ddi_dma_mem_free(&dma->acc_hdl);
-	if (dma->dma_hdl != NULL)
+	if (dma->allocated)
 		ddi_dma_free_handle(&dma->dma_hdl);
 	bzero(dma, sizeof (*dma));
 	return (0);
@@ -252,11 +365,230 @@ iwm_fw_free(struct iwm_fw_info *fw)
 	fw->size = 0;
 }
 
+/* A read after the mask write flushes posted MMIO before host enable. */
+static int
+iwm_mask(struct iwm_softc *sc)
+{
+	uint32_t mask;
+
+	if (iwm_reg_write(sc, IWM_CSR_INT_MASK, 0) != 0 ||
+	    iwm_reg_read(sc, IWM_CSR_INT_MASK, &mask) != 0 || mask != 0)
+		return (EIO);
+	return (0);
+}
+
+static boolean_t
+iwm_csr_unavailable(uint32_t value)
+{
+	return (value == 0xffffffff || (value & 0xfffffff0) == 0xa5a5a5a0);
+}
+
+static int
+iwm_passive_csr(struct iwm_softc *sc)
+{
+	uint32_t causes, fh, mask;
+
+	if (iwm_reg_read(sc, IWM_CSR_HW_REV, &sc->hw_rev) != 0 ||
+	    iwm_reg_read(sc, IWM_CSR_GP_CNTRL, &sc->gp_cntrl) != 0 ||
+	    iwm_reg_read(sc, IWM_CSR_INT_MASK, &mask) != 0 ||
+	    iwm_csr_unavailable(sc->hw_rev) ||
+	    iwm_csr_unavailable(sc->gp_cntrl) || iwm_csr_unavailable(mask))
+		return (EIO);
+	sc->csr_valid = B_TRUE;
+	dev_err(sc->dip, CE_NOTE, "!iwm BAR size=%ld HW_REV=%08x "
+	    "GP_CNTRL=%08x rfkill=%s initial-mask=%08x", (long)sc->regsize,
+	    sc->hw_rev, sc->gp_cntrl,
+	    (sc->gp_cntrl & IWM_CSR_GP_CNTRL_REG_FLAG_HW_RF_KILL_SW) ?
+	    "off" : "on", mask);
+	if (iwm_mask(sc) != 0 ||
+	    iwm_reg_read(sc, IWM_CSR_INT, &causes) != 0 ||
+	    iwm_reg_read(sc, IWM_CSR_FH_INT_STATUS, &fh) != 0)
+		return (EIO);
+	dev_err(sc->dip, CE_NOTE, "!iwm stale causes=%08x fh=%08x",
+	    causes, fh);
+	if ((causes & ~IWM_PASSIVE_INT_CAUSES) != 0 ||
+	    (fh & ~IWM_PASSIVE_FH_CAUSES) != 0)
+		return (EIO);
+	/* Write-one-to-clear only the recognised causes actually observed. */
+	(void) iwm_reg_write(sc, IWM_CSR_INT, causes);
+	(void) iwm_reg_write(sc, IWM_CSR_FH_INT_STATUS, fh);
+	return (iwm_checkpoint(sc, "csr-mask"));
+}
+
+static uint_t
+iwm_intr(caddr_t arg, caddr_t unused)
+{
+	struct iwm_softc *sc = (void *)arg;
+	uint32_t causes = 0, fh = 0;
+	uint32_t ack, fh_ack;
+	uint_t result = DDI_INTR_UNCLAIMED;
+
+	_NOTE(ARGUNUSED(unused));
+	mutex_enter(&sc->lock);
+	sc->intr_calls++;
+	(void) iwm_mask(sc);
+	if (iwm_reg_read(sc, IWM_CSR_INT, &causes) == 0 &&
+	    iwm_reg_read(sc, IWM_CSR_FH_INT_STATUS, &fh) == 0 &&
+	    !iwm_csr_unavailable(causes) && !iwm_csr_unavailable(fh)) {
+		ack = causes & IWM_PASSIVE_INT_CAUSES;
+		fh_ack = fh & IWM_PASSIVE_FH_CAUSES;
+		if (ack != 0 || fh_ack != 0) {
+			(void) iwm_reg_write(sc, IWM_CSR_INT, ack);
+			(void) iwm_reg_write(sc, IWM_CSR_FH_INT_STATUS, fh_ack);
+			result = DDI_INTR_CLAIMED;
+		}
+	}
+	/* Any callback is unexpected with device sources masked.  Log once. */
+	if (!sc->intr_fault)
+		dev_err(sc->dip, CE_WARN, "!iwm unexpected passive interrupt "
+		    "causes=%08x fh=%08x; sources remain masked", causes, fh);
+	sc->intr_fault = B_TRUE;
+	mutex_exit(&sc->lock);
+	return (result);
+}
+
+static int
+iwm_intr_open(struct iwm_softc *sc)
+{
+	int count, available, actual;
+
+	if (ddi_intr_get_supported_types(sc->dip, &sc->intr_types) !=
+	    DDI_SUCCESS || !(sc->intr_types & DDI_INTR_TYPE_MSI))
+		return (ENOTSUP);
+	/* MSI uses the donor's single-vector CSR path, with no ICT routing. */
+	if (ddi_intr_get_nintrs(sc->dip, DDI_INTR_TYPE_MSI, &count) !=
+	    DDI_SUCCESS || count < 1 ||
+	    ddi_intr_get_navail(sc->dip, DDI_INTR_TYPE_MSI, &available) !=
+	    DDI_SUCCESS || available < 1)
+		return (ENOSPC);
+	if (ddi_intr_alloc(sc->dip, &sc->intr, DDI_INTR_TYPE_MSI, 0, 1,
+	    &actual, DDI_INTR_ALLOC_STRICT) != DDI_SUCCESS)
+		return (EIO);
+	sc->intr_allocated = B_TRUE;
+	if (actual != 1 || iwm_checkpoint(sc, "interrupt-handle") != 0 ||
+	    ddi_intr_get_pri(sc->intr, &sc->intr_pri) != DDI_SUCCESS ||
+	    sc->intr_pri >= ddi_intr_get_hilevel_pri() ||
+	    ddi_intr_get_cap(sc->intr, &sc->intr_cap) != DDI_SUCCESS)
+		return (EIO);
+	mutex_init(&sc->lock, NULL, MUTEX_DRIVER, DDI_INTR_PRI(sc->intr_pri));
+	sc->lock_initialized = B_TRUE;
+	if (iwm_checkpoint(sc, "interrupt-lock") != 0)
+		return (EIO);
+	if (ddi_intr_add_handler(sc->intr, iwm_intr, sc, NULL) != DDI_SUCCESS)
+		return (EIO);
+	sc->intr_added = B_TRUE;
+	dev_err(sc->dip, CE_NOTE, "!iwm interrupt supported=%x selected=MSI "
+	    "count=1 priority=%u capabilities=%x", sc->intr_types,
+	    sc->intr_pri, sc->intr_cap);
+	return (iwm_checkpoint(sc, "interrupt-handler"));
+}
+
+static int
+iwm_intr_disable(struct iwm_softc *sc)
+{
+	int error;
+
+	if (!sc->intr_enabled)
+		return (0);
+	if (sc->intr_cap & DDI_INTR_FLAG_BLOCK)
+		error = ddi_intr_block_disable(&sc->intr, 1);
+	else
+		error = ddi_intr_disable(sc->intr);
+	if (error != DDI_SUCCESS)
+		return (EIO);
+	sc->intr_enabled = B_FALSE;
+	return (0);
+}
+
+static int
+iwm_intr_test(struct iwm_softc *sc)
+{
+	int error;
+	boolean_t fault;
+
+	if (iwm_mask(sc) != 0)
+		return (EIO);
+	if (sc->intr_cap & DDI_INTR_FLAG_BLOCK)
+		error = ddi_intr_block_enable(&sc->intr, 1);
+	else
+		error = ddi_intr_enable(sc->intr);
+	if (error != DDI_SUCCESS)
+		return (EIO);
+	sc->intr_enabled = B_TRUE;
+	if (iwm_checkpoint(sc, "interrupt-enabled") != 0)
+		return (EIO);
+	/* Observe for one tick, without holding a lock while asleep. */
+	delay(1);
+	if (iwm_intr_disable(sc) != 0)
+		return (EIO);
+	mutex_enter(&sc->lock);
+	fault = sc->intr_fault;
+	mutex_exit(&sc->lock);
+	if (fault || iwm_mask(sc) != 0)
+		return (EIO);
+	dev_err(sc->dip, CE_NOTE, "!iwm host MSI enable/disable passed; "
+	    "device mask=0 callbacks=%u", sc->intr_calls);
+	return (iwm_checkpoint(sc, "interrupt-disabled"));
+}
+
+/*
+ * No address was published and the handler never touches DMA memory.  Keep
+ * any resource whose release fails, and prevent module removal while its
+ * soft state remains.  A cleanup failure requires operator investigation;
+ * it must never become a use-after-free or a forced removal.
+ */
+static int
+iwm_cleanup(struct iwm_softc *sc)
+{
+	int i;
+	int mask_error = 0;
+	uint16_t command;
+
+	if (sc->csr_valid && iwm_mask(sc) != 0)
+		mask_error = EIO;
+	if (iwm_intr_disable(sc) != 0)
+		return (EIO);
+	if (mask_error != 0)
+		return (mask_error);
+	for (i = IWM_PASSIVE_DMA_COUNT - 1; i >= 0; i--) {
+		if (iwm_dma_free(&sc->dma[i]) != 0)
+			return (EIO);
+	}
+	if (sc->intr_added) {
+		if (ddi_intr_remove_handler(sc->intr) != DDI_SUCCESS)
+			return (EIO);
+		sc->intr_added = B_FALSE;
+	}
+	if (sc->lock_initialized) {
+		mutex_destroy(&sc->lock);
+		sc->lock_initialized = B_FALSE;
+	}
+	if (sc->intr_allocated) {
+		if (ddi_intr_free(sc->intr) != DDI_SUCCESS)
+			return (EIO);
+		sc->intr_allocated = B_FALSE;
+		sc->intr = NULL;
+	}
+	if (sc->cfg != NULL && sc->pcih != NULL) {
+		command = pci_config_get16(sc->pcih, PCI_CONF_COMM);
+		dev_err(sc->dip, CE_NOTE, "!iwm PCI command after=%04x "
+		    "before=%04x", command, sc->pci_command);
+		if ((command ^ sc->pci_command) & PCI_COMM_ME)
+			dev_err(sc->dip, CE_WARN,
+			    "!iwm bus-master state changed");
+	}
+	iwm_pci_unmap(sc);
+	sc->csr_valid = B_FALSE;
+	return (0);
+}
+
 static int
 iwm_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 {
 	struct iwm_softc *sc;
 	int instance = ddi_get_instance(dip);
+	int i;
+	uint16_t command;
 
 	if (cmd != DDI_ATTACH)
 		return (DDI_FAILURE);
@@ -264,33 +596,80 @@ iwm_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 		return (DDI_FAILURE);
 	sc = ddi_get_soft_state(iwm_state, instance);
 	sc->dip = dip;
-	sc->cfg = &iwm_8260;
 	ddi_set_driver_private(dip, sc);
+	sc->fail_step = ddi_prop_get_int(DDI_DEV_T_ANY, dip,
+	    DDI_PROP_DONTPASS, "iwm-attach-fail", 0);
+	if (sc->fail_step < 0 || sc->fail_step > 25 ||
+	    iwm_checkpoint(sc, "soft-state") != 0 ||
+	    iwm_pci_map(sc) != 0 || iwm_passive_csr(sc) != 0 ||
+	    iwm_intr_open(sc) != 0)
+		goto fail;
+	for (i = 0; i < IWM_PASSIVE_DMA_COUNT; i++) {
+		if (iwm_dma_alloc(sc, &sc->dma[i], iwm_passive_dma[i].size,
+		    iwm_passive_dma[i].align, DDI_DMA_RDWR) != 0)
+			goto fail;
+		dev_err(dip, CE_NOTE, "!iwm DMA %s size=%lu align=%u "
+		    "cookies=1 address-width<=36 unpublished",
+		    iwm_passive_dma[i].name, (ulong_t)sc->dma[i].size,
+		    iwm_passive_dma[i].align);
+	}
+	if (iwm_intr_test(sc) != 0)
+		goto fail;
+	command = pci_config_get16(sc->pcih, PCI_CONF_COMM);
+	if ((command ^ sc->pci_command) & PCI_COMM_ME)
+		goto fail;
+	sc->attached = B_TRUE;
+	dev_err(dip, CE_NOTE, "!iwm passive attach complete, %d checkpoints; "
+	    "PCI command=%04x; no firmware, DMA publication or MAC",
+	    sc->attach_step, command);
+	return (DDI_SUCCESS);
 
-	/*
-	 * No PCI, BAR, DMA, interrupt, firmware or wireless operation may
-	 * precede this rejection.  Removing it requires a real attach/unwind
-	 * and quiesce implementation, not a property or a success stub.
-	 */
-	dev_err(dip, CE_WARN, "!iwm hardware attachment is not implemented");
+fail:
+	dev_err(dip, CE_WARN, "!iwm passive attach failed at step %d",
+	    sc->attach_step);
+	if (iwm_cleanup(sc) != 0) {
+		/* Pin the retained handler's devinfo until recovery reboot. */
+		ndi_hold_devi(dip);
+		atomic_inc_32(&iwm_retained);
+		dev_err(dip, CE_WARN, "!iwm cleanup failed; resources retained;"
+		    " module removal prohibited");
+		return (DDI_FAILURE);
+	}
 	ddi_set_driver_private(dip, NULL);
 	ddi_soft_state_free(iwm_state, instance);
+	dev_err(dip, CE_NOTE, "!iwm failed attach fully unwound");
 	return (DDI_FAILURE);
 }
 
-/* No instance can attach.  Detach, suspend and quiesce are unsupported. */
+/* Suspend/resume remain unsupported; a full detach releases every resource. */
 static int
 iwm_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
 {
-	_NOTE(ARGUNUSED(dip, cmd));
-	return (DDI_FAILURE);
+	struct iwm_softc *sc = ddi_get_driver_private(dip);
+
+	if (cmd != DDI_DETACH || sc == NULL || !sc->attached)
+		return (DDI_FAILURE);
+	if (iwm_cleanup(sc) != 0) {
+		dev_err(dip, CE_WARN, "!iwm detach cleanup failed; retained");
+		return (DDI_FAILURE);
+	}
+	ddi_set_driver_private(dip, NULL);
+	ddi_soft_state_free(iwm_state, ddi_get_instance(dip));
+	dev_err(dip, CE_NOTE, "!iwm passive detach complete");
+	return (DDI_SUCCESS);
 }
 
 static int
 iwm_quiesce(dev_info_t *dip)
 {
-	_NOTE(ARGUNUSED(dip));
-	return (DDI_FAILURE);
+	struct iwm_softc *sc = ddi_get_driver_private(dip);
+
+	/* No locks, waits, interrupt teardown or mapping teardown here. */
+	if (sc == NULL || !sc->attached || !sc->csr_valid ||
+	    iwm_mask(sc) != 0)
+		return (DDI_FAILURE);
+	/* No engines were started and no DMA address was ever published. */
+	return (DDI_SUCCESS);
 }
 
 DDI_DEFINE_STREAM_OPS(iwm_devops, nulldev, nulldev, iwm_attach,
@@ -298,7 +677,7 @@ DDI_DEFINE_STREAM_OPS(iwm_devops, nulldev, nulldev, iwm_attach,
 
 static struct modldrv iwm_modldrv = {
 	&mod_driverops,
-	"Intel 8260 transport (attachment disabled)",
+	"Intel 8260 passive transport",
 	&iwm_devops
 };
 
@@ -326,7 +705,12 @@ _init(void)
 int
 _fini(void)
 {
-	int error = mod_remove(&iwm_modlinkage);
+	int error;
+
+	/* Also covers retained ownership after a failed attach or cleanup. */
+	if (iwm_retained != 0)
+		return (EBUSY);
+	error = mod_remove(&iwm_modlinkage);
 
 	if (error == 0) {
 		mac_fini_ops(&iwm_devops);

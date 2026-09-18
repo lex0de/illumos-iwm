@@ -17,7 +17,7 @@
 set name=pkg.fmri value=pkg:/driver/network/iwm@$(PKGVERS)
 set name=pkg.summary value="Intel 8260 driver development module"
 set name=pkg.description \
-    value="Intel 8260 native transport skeleton; hardware attachment disabled"
+    value="Intel 8260 passive native transport; wireless operation unavailable"
 set name=info.classification \
     value=org.opensolaris.category.2008:Drivers/Networking
 set name=variant.arch value=i386

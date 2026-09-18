@@ -97,6 +97,26 @@ extern "C" {
 #define	IWM_CSR_HW_REV		0x028
 #define	IWM_CSR_INT_PERIODIC_REG	0x005
 
+/* Pinned donor CSR fields; no MAC clock or peripheral access is required. */
+#define	IWM_CSR_GP_CNTRL_REG_FLAG_HW_RF_KILL_SW	0x08000000
+#define	IWM_CSR_INT_BIT_FH_RX	(1U << 31)
+#define	IWM_CSR_INT_BIT_HW_ERR	(1U << 29)
+#define	IWM_CSR_INT_BIT_RX_PERIODIC	(1U << 28)
+#define	IWM_CSR_INT_BIT_FH_TX	(1U << 27)
+#define	IWM_CSR_INT_BIT_SCD	(1U << 26)
+#define	IWM_CSR_INT_BIT_SW_ERR	(1U << 25)
+#define	IWM_CSR_INT_BIT_RF_KILL	(1U << 7)
+#define	IWM_CSR_INT_BIT_CT_KILL	(1U << 6)
+#define	IWM_CSR_INT_BIT_SW_RX	(1U << 3)
+#define	IWM_CSR_INT_BIT_WAKEUP	(1U << 1)
+#define	IWM_CSR_INT_BIT_ALIVE	(1U << 0)
+#define	IWM_CSR_FH_INT_BIT_ERR	(1U << 31)
+#define	IWM_CSR_FH_INT_BIT_HI_PRIOR	(1U << 30)
+#define	IWM_CSR_FH_INT_BIT_RX_CHNL1	(1U << 17)
+#define	IWM_CSR_FH_INT_BIT_RX_CHNL0	(1U << 16)
+#define	IWM_CSR_FH_INT_BIT_TX_CHNL1	(1U << 1)
+#define	IWM_CSR_FH_INT_BIT_TX_CHNL0	(1U << 0)
+
 struct iwm_ucode_tlv {
 	uint32_t type;		/* see above */
 	uint32_t length;		/* not including type/length fields */
