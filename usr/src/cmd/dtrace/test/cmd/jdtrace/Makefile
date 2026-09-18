@@ -73,7 +73,7 @@ $(PROG): $(SRCS)
 	$(POST_PROCESS) ; $(STRIP_STABS)
 
 JFLAGS= -g -cp $(CLASSPATH) -d $(CLASSDIR)
-JFLAGS += -source 7 -target 7 -Xlint:all,-options
+JFLAGS += -source 8 -target 8 -Xlint:none
 COMPILE.java=$(JAVAC) $(JFLAGS)
 JAVASRC= JDTrace.java Getopt.java
 

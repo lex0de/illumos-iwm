@@ -141,7 +141,7 @@ $(SUBDIRS): FRC
 
 doc:	all
 	$(JAVADOC) -private -classpath $(JARFILE): -sourcepath . \
-	    -source 7 -d $(DOCDIR) $(PACKAGEDOCS)
+	    -source 8 -d $(DOCDIR) $(PACKAGEDOCS)
 
 $(PROG):	$(OBJS)
 	$(LINK.c) -o $(PROG) $(OBJS) $(LDLIBS)

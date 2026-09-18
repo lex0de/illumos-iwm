@@ -41,7 +41,7 @@ ADTXMLFILE	= $(LIBBSMDIR)/common/adt.xml
 
 .KEEP_STATE:
 
-all: $(PROG) $(ATTR)
+all: $(PROG) $(ATTR) 
 
 install: all $(ROOTUSRSBINPROG) install_data
 
@@ -66,7 +66,7 @@ $(ROOTUSRSBINPROG): $(PROG)
 	$(INS.file) $(PROG)
 
 $(PROG).po: $(PROG) $(ATTR) $(AGETTEXT)
-	export PERL5LIB; PERL5LIB=../perl/contrib; \
+	export PERL5LIB; PERL5LIB=$(ROOT)/usr/perl5/$(PERL_VERSION)/lib; \
 	./$(AGETTEXT) $(TEXT_DOMAIN) $(PROG).po; \
 	$(XGETTEXT) -d $(PROG) -j $(PROG)
 

@@ -21,7 +21,6 @@
 #
 # Copyright (c) 1990, 2010, Oracle and/or its affiliates. All rights reserved.
 # Copyright 2010 Nexenta Systems, Inc.  All rights reserved.
-# Copyright 2012 OmniTI Computer Consulting, Inc.  All rights reserved.
 #
 
 ETCFILES= ioctl.syscon passwd shadow motd
@@ -62,7 +61,8 @@ clobber:
 
 motd:	FRC
 	@-$(ECHO) "rebuilding motd"
-	@-$(ECHO) "OmniOS r$(ONNV_BUILDNUM)\t$(VERSION)\t$(RELEASE_DATE)" > motd
+	@$(RELEASE_BUILD)-$(ECHO) "The illumos Project\t$(VERSION)\t$(RELEASE_DATE)" > motd
+	@$(NOT_RELEASE_BUILD)-$(ECHO) "The illumos Project\t$(VERSION)\t`date +'%h. %d, %Y'`" > motd
 	@$(NOT_RELEASE_BUILD)-$(ECHO) $(DEV_CM) | sed -e "s/@(#)//" >> motd
 	@-$(CAT) release_info >> motd
 

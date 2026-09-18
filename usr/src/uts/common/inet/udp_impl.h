@@ -119,9 +119,9 @@ typedef struct {
 #define	UDP_NUM_EPRIV_PORTS	64
 
 /* Default buffer size and flow control wake up threshold. */
-#define	UDP_RECV_HIWATER	(56 * 1024)
+#define	UDP_RECV_HIWATER	4194304
 #define	UDP_RECV_LOWATER	128
-#define	UDP_XMIT_HIWATER	(56 * 1024)
+#define	UDP_XMIT_HIWATER	4194304
 #define	UDP_XMIT_LOWATER	1024
 
 /*

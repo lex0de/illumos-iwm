@@ -58,7 +58,7 @@ all: default
 install: all $(PROTO_TEST_JAR)
 
 JFLAGS= -g -cp $(CLASSPATH) -d $(CLASSDIR)
-JFLAGS += -source 7 -target 7 -Xlint:all,-deprecation,-options,-rawtypes
+JFLAGS += -source 8 -target 8 -Xlint:none
 COMPILE.java=$(JAVAC) $(JFLAGS)
 
 $(TEST_JAR): $(SRCDIR)/*.java

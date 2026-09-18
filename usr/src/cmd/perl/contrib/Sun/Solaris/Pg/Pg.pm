@@ -1297,10 +1297,10 @@ sub _capacity_update
 
 		$c1->{CAPACITY}->{$shname1} = $max_rate if
 		  !$c1->{CAPACITY}->{$shname1} ||
-		    !$c1->{CAPACITY}->{$shname1} < $max_rate;
+		    $c1->{CAPACITY}->{$shname1} < $max_rate;
 		$c2->{CAPACITY}->{$shname2} = $max_rate if
 		  !$c2->{CAPACITY}->{$shname2} ||
-		    !$c2->{CAPACITY}->{$shname2} < $max_rate;
+		    $c2->{CAPACITY}->{$shname2} < $max_rate;
 	}
 }
 
@@ -1423,7 +1423,7 @@ sub _set_intersect
 sub _expand
 {
 	# Skip the first argument if it is the object reference
-	shift if ref $@[0] eq 'HASH';
+	shift if ref $_[0] eq 'HASH';
 
 	my $arg = shift;
 
@@ -1464,7 +1464,7 @@ sub _collapse
 	my $result = '';
 	my $end = $start;	# Initial range consists of the first element
 	foreach my $el (@args) {
-		if (!$el =~ /^\d+$/) {
+		if ($el !~ /^\d+$/) {
 			$result = "$result $el";
 			$end = $el;
 		} elsif ($el == ($end + 1)) {

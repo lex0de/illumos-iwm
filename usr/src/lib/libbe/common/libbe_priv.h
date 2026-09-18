@@ -74,7 +74,7 @@ extern "C" {
 
 #define	BE_ZONE_PARENTBE_PROPERTY	"org.opensolaris.libbe:parentbe"
 #define	BE_ZONE_ACTIVE_PROPERTY		"org.opensolaris.libbe:active"
-#define	BE_ZONE_SUPPORTED_BRANDS	"ipkg labeled lipkg sparse pkgsrc"
+#define	BE_ZONE_SUPPORTED_BRANDS	"labeled sparse-root alien-root whole-root"
 #define	BE_ZONE_SUPPORTED_BRANDS_DELIM	" "
 
 /* Maximum length for the BE name. */

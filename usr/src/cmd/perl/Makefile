@@ -10,7 +10,6 @@
 #
 #
 # Copyright (c) 2014 Racktop Systems.
-# Copyright 2021 OmniOS Community Edition (OmniOSce) Association.
 #
 
 include $(SRC)/cmd/Makefile.cmd
@@ -21,10 +20,8 @@ SUBDIRS = \
 	contrib/Sun/Solaris/Kstat \
 	contrib/Sun/Solaris/Lgrp \
 	contrib/Sun/Solaris/Pg \
-	contrib/Sun/Solaris/Privilege \
 	contrib/Sun/Solaris/Project \
 	contrib/Sun/Solaris/Task \
-	contrib/Sun/Solaris/Ucred \
 	contrib/Sun/Solaris/Utils
 
 all :=		TARGET = all

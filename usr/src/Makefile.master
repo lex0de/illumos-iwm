@@ -126,7 +126,6 @@ JAVA_ROOT=	/usr/jdk/openjdk17.0
 BLD_JAVA_11=
 
 # OmniOS has 64bit Perl only. Disable building of 32bit Perl modules
-BUILDPERL32=	$(POUND_SIGN)
 
 # The python 2 modules are not built by default in OmniOS
 BUILDPY2=	$(POUND_SIGN)
@@ -610,8 +609,8 @@ CPPFLAGS.native=$(ENVCPPFLAGS1) $(ENVCPPFLAGS2) $(ENVCPPFLAGS3) \
 		$(ENVCPPFLAGS4) -I$(NATIVE_ADJUNCT)/include
 CPPFLAGS=	$(CPPFLAGS.first) $(CPPFLAGS.master)
 AS_CPPFLAGS=	$(CPPFLAGS.first) $(CPPFLAGS.master)
-JAVAFLAGS=	-source 7 -target 7 -Xlint:deprecation,-options
-$(BLD_JAVA_11)JAVAFLAGS=	-source 7 -target 7 -Xlint:-options
+JAVAFLAGS=	-source 8 -target 8 -Xlint:deprecation,-options
+$(BLD_JAVA_11)JAVAFLAGS=	-source 8 -target 8 -Xlint:none
 
 #
 # For source message catalogue

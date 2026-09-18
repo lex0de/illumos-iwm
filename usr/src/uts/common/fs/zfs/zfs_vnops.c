@@ -3168,20 +3168,6 @@ zfs_setattr(vnode_t *vp, vattr_t *vap, int flags, cred_t *cr,
 	 * Note: ZFS_READONLY is handled in zfs_zaccess_common.
 	 */
 
-	/*
-	 * Verify timestamps doesn't overflow 32 bits.
-	 * ZFS can handle large timestamps, but 32bit syscalls can't
-	 * handle times greater than 2039.  This check should be removed
-	 * once large timestamps are fully supported.
-	 */
-	if (mask & (AT_ATIME | AT_MTIME)) {
-		if (((mask & AT_ATIME) && TIMESPEC_OVERFLOW(&vap->va_atime)) ||
-		    ((mask & AT_MTIME) && TIMESPEC_OVERFLOW(&vap->va_mtime))) {
-			ZFS_EXIT(zfsvfs);
-			return (SET_ERROR(EOVERFLOW));
-		}
-	}
-
 top:
 	attrzp = NULL;
 	aclp = NULL;

@@ -23,7 +23,6 @@
 # Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
 # Copyright 2015, OmniTI Computer Consulting, Inc. All rights reserved.
 # Copyright 2016 RackTop Systems.
-# Copyright 2021 OmniOS Community Edition (OmniOSce) Association.
 #
 
 <transform file path=.*\.pm -> default mode 0444>
@@ -44,10 +43,8 @@ $(BUILDPERL32)dir path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH)/Sun/Solaris
 $(BUILDPERL32)file path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH)/Sun/Solaris/Intrs.pm
 $(BUILDPERL32)file path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH)/Sun/Solaris/Kstat.pm
 $(BUILDPERL32)file path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH)/Sun/Solaris/Lgrp.pm
-$(BUILDPERL32)file path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH)/Sun/Solaris/Privilege.pm
 $(BUILDPERL32)file path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH)/Sun/Solaris/Project.pm
 $(BUILDPERL32)file path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH)/Sun/Solaris/Task.pm
-$(BUILDPERL32)file path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH)/Sun/Solaris/Ucred.pm
 $(BUILDPERL32)file path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH)/Sun/Solaris/Utils.pm
 $(BUILDPERL32)dir path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH)/auto
 $(BUILDPERL32)dir path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH)/auto/Sun
@@ -58,14 +55,10 @@ $(BUILDPERL32)dir path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH)/auto/Sun/Solar
 $(BUILDPERL32)file path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH)/auto/Sun/Solaris/Kstat/Kstat.so
 $(BUILDPERL32)dir path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH)/auto/Sun/Solaris/Lgrp
 $(BUILDPERL32)file path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH)/auto/Sun/Solaris/Lgrp/Lgrp.so
-$(BUILDPERL32)dir path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH)/auto/Sun/Solaris/Privilege
-$(BUILDPERL32)file path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH)/auto/Sun/Solaris/Privilege/Privilege.so
 $(BUILDPERL32)dir path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH)/auto/Sun/Solaris/Project
 $(BUILDPERL32)file path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH)/auto/Sun/Solaris/Project/Project.so
 $(BUILDPERL32)dir path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH)/auto/Sun/Solaris/Task
 $(BUILDPERL32)file path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH)/auto/Sun/Solaris/Task/Task.so
-$(BUILDPERL32)dir path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH)/auto/Sun/Solaris/Ucred
-$(BUILDPERL32)file path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH)/auto/Sun/Solaris/Ucred/Ucred.so
 $(BUILDPERL32)dir path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH)/auto/Sun/Solaris/Utils
 $(BUILDPERL32)file path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH)/auto/Sun/Solaris/Utils/Utils.so
 $(BUILDPERL64)dir path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH64)
@@ -74,10 +67,8 @@ $(BUILDPERL64)dir path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH64)/Sun/Solaris
 $(BUILDPERL64)file path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH64)/Sun/Solaris/Intrs.pm
 $(BUILDPERL64)file path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH64)/Sun/Solaris/Kstat.pm
 $(BUILDPERL64)file path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH64)/Sun/Solaris/Lgrp.pm
-$(BUILDPERL64)file path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH64)/Sun/Solaris/Privilege.pm
 $(BUILDPERL64)file path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH64)/Sun/Solaris/Project.pm
 $(BUILDPERL64)file path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH64)/Sun/Solaris/Task.pm
-$(BUILDPERL64)file path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH64)/Sun/Solaris/Ucred.pm
 $(BUILDPERL64)file path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH64)/Sun/Solaris/Utils.pm
 $(BUILDPERL64)dir path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH64)/auto
 $(BUILDPERL64)dir path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH64)/auto/Sun
@@ -88,14 +79,10 @@ $(BUILDPERL64)dir path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH64)/auto/Sun/Sol
 $(BUILDPERL64)file path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH64)/auto/Sun/Solaris/Kstat/Kstat.so
 $(BUILDPERL64)dir path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH64)/auto/Sun/Solaris/Lgrp
 $(BUILDPERL64)file path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH64)/auto/Sun/Solaris/Lgrp/Lgrp.so
-$(BUILDPERL64)dir path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH64)/auto/Sun/Solaris/Privilege
-$(BUILDPERL64)file path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH64)/auto/Sun/Solaris/Privilege/Privilege.so
 $(BUILDPERL64)dir path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH64)/auto/Sun/Solaris/Project
 $(BUILDPERL64)file path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH64)/auto/Sun/Solaris/Project/Project.so
 $(BUILDPERL64)dir path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH64)/auto/Sun/Solaris/Task
 $(BUILDPERL64)file path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH64)/auto/Sun/Solaris/Task/Task.so
-$(BUILDPERL64)dir path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH64)/auto/Sun/Solaris/Ucred
-$(BUILDPERL64)file path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH64)/auto/Sun/Solaris/Ucred/Ucred.so
 $(BUILDPERL64)dir path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH64)/auto/Sun/Solaris/Utils
 $(BUILDPERL64)file path=usr/perl5/$(PERL_VERSION)/lib/$(PERL_ARCH64)/auto/Sun/Solaris/Utils/Utils.so
 dir  path=usr/perl5/$(PERL_VERSION)/lib/Sun
@@ -107,10 +94,8 @@ dir  path=usr/share/man
 dir  path=usr/share/man/man3perl
 file path=usr/share/man/man3perl/Kstat.3perl
 file path=usr/share/man/man3perl/Lgrp.3perl
-file path=usr/share/man/man3perl/Privilege.3perl
 file path=usr/share/man/man3perl/Project.3perl
 file path=usr/share/man/man3perl/Task.3perl
-file path=usr/share/man/man3perl/Ucred.3perl
 license cr_Sun license=cr_Sun
 license usr/src/cmd/perl/THIRDPARTYLICENSE \
     license=usr/src/cmd/perl/THIRDPARTYLICENSE

@@ -26,7 +26,7 @@
 
 include	../Makefile.lib
 
-SUBDIRS= py3
+SUBDIRS=
 $(BUILDPY3b)SUBDIRS += py3b
 
 all :=		TARGET= all

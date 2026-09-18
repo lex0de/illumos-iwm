@@ -13,7 +13,6 @@
 # Copyright 2011, Richard Lowe
 # Copyright 2013 Nexenta Systems, Inc.  All rights reserved.
 # Copyright (c) 2014 Racktop Systems.
-# Copyright 2021 OmniOS Community Edition (OmniOSce) Association.
 #
 
 include		$(SRC)/Makefile.master
@@ -22,10 +21,8 @@ MANSECT=	3perl
 
 MANFILES=	Kstat.3perl			\
 		Lgrp.3perl			\
-		Privilege.3perl			\
 		Project.3perl			\
-		Task.3perl			\
-		Ucred.3perl
+		Task.3perl
 
 .KEEP_STATE:
 

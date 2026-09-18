@@ -52,12 +52,6 @@ COMMON_MODULES_PROC = \
 	mdb_test
 
 #
-# MDB modules used for debugging user processes which are only 64-bit
-#
-COMMON_MODULES_PROC_64BIT = \
-	libpython
-
-#
 # MDB modules used for debugging user processes which are only 32-bit
 #
 COMMON_MODULES_PROC_32BIT = \

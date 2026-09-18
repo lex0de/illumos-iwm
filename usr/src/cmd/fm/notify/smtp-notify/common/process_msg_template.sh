@@ -47,7 +47,7 @@ if [ ! -e $1 ] || [ ! -r $1 ]; then
 	exit 1
 fi
 
-/usr/has/bin/file $1 | grep "ascii text" > /dev/null
+/usr/bin/file $1 | grep -i "ascii text" > /dev/null
 if [ $? != 0 ]; then
 	exit 1
 fi

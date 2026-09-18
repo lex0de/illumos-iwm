@@ -62,9 +62,9 @@ extern sock_downcalls_t sock_tcp_downcalls;
  * by setting it to 0.
  */
 #define	TCP_XMIT_LOWATER	4096
-#define	TCP_XMIT_HIWATER	49152
+#define	TCP_XMIT_HIWATER	8388608
 #define	TCP_RECV_LOWATER	2048
-#define	TCP_RECV_HIWATER	128000
+#define	TCP_RECV_HIWATER	8388608
 
 /*
  * Bind hash list size and has function.  It has to be a power of 2 for
