@@ -1,0 +1,229 @@
+/* BEGIN CSTYLED */
+/*	$OpenBSD: if_iwmvar.h,v 1.79 2025/12/01 16:30:46 stsp Exp $	*/
+
+/*
+ * Copyright (c) 2014 genua mbh <info@genua.de>
+ * Copyright (c) 2014 Fixup Software Ltd.
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+/*-
+ * Based on BSD-licensed source modules in the Linux iwlwifi driver,
+ * which were used as the reference documentation for this implementation.
+ *
+ * Driver version we are currently based off of is
+ * Linux 3.14.3 (tag id a2df521e42b1d9a23f620ac79dbfe8655a8391dd)
+ *
+ ***********************************************************************
+ *
+ * This file is provided under a dual BSD/GPLv2 license.  When using or
+ * redistributing this file, you may do so under either license.
+ *
+ * GPL LICENSE SUMMARY
+ *
+ * Copyright(c) 2007 - 2013 Intel Corporation. All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of version 2 of the GNU General Public License as
+ * published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110,
+ * USA
+ *
+ * The full GNU General Public License is included in this distribution
+ * in the file called COPYING.
+ *
+ * Contact Information:
+ *  Intel Linux Wireless <ilw@linux.intel.com>
+ * Intel Corporation, 5200 N.E. Elam Young Parkway, Hillsboro, OR 97124-6497
+ *
+ *
+ * BSD LICENSE
+ *
+ * Copyright(c) 2005 - 2013 Intel Corporation. All rights reserved.
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ *
+ *  * Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ *  * Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in
+ *    the documentation and/or other materials provided with the
+ *    distribution.
+ *  * Neither the name Intel Corporation nor the names of its
+ *    contributors may be used to endorse or promote products derived
+ *    from this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+/*-
+ * Copyright (c) 2007-2010 Damien Bergamini <damien.bergamini@free.fr>
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+/* END CSTYLED */
+
+/*
+ * Copyright 2026 lex0de <lex0de@tuta.com>
+ * Preserve the original donor licence notices above verbatim.
+ */
+
+/*
+ * Derived from OpenBSD sys/dev/pci/if_iwmvar.h at
+ * 0efabb066d34187a404f31d303b3b97103df1117, BSD licence option.
+ * The ring shape and 8000-family limits are retained.  OS-owned resources
+ * use illumos types.  No aggregation, radiotap or other device families.
+ */
+#ifndef _IF_IWMVAR_H
+#define	_IF_IWMVAR_H
+
+#include <sys/ddi.h>
+#include <sys/sunddi.h>
+#include <sys/net80211.h>
+#include <io/iwm/if_iwmreg.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define	IWM_TX_RING_COUNT	256
+#define	IWM_RX_RING_COUNT	256
+#define	IWM_RBUF_SIZE		4096
+#define	IWM_FWDMASEGSZ_8000	(320 * 1024)
+#define	IWM_DEVICE_FAMILY_8000	2
+#define	IWM_UCODE_SECT_MAX	16
+
+/* Host-owned until a later, reviewed hardware start path publishes it. */
+struct iwm_dma_info {
+	ddi_dma_handle_t	dma_hdl;
+	ddi_acc_handle_t	acc_hdl;
+	ddi_dma_cookie_t	cookie;
+	caddr_t		vaddr;
+	size_t		length;
+	size_t		size;
+	boolean_t	bound;
+};
+
+struct iwm_tx_data {
+	struct iwm_dma_info	dma;
+	mblk_t			*mp;
+	struct ieee80211_node	*ni;
+};
+
+struct iwm_tx_ring {
+	struct iwm_dma_info	desc_dma;
+	struct iwm_dma_info	cmd_dma;
+	struct iwm_tfd		*desc;
+	struct iwm_device_cmd	*cmd;
+	struct iwm_tx_data	data[IWM_TX_RING_COUNT];
+	uint_t			qid;
+	uint_t			queued;
+	uint_t			cur;
+	uint_t			tail;
+};
+
+struct iwm_rx_ring {
+	struct iwm_dma_info	desc_dma;
+	struct iwm_dma_info	stat_dma;
+	uint32_t		*desc;
+	struct iwm_rb_status	*stat;
+	struct iwm_dma_info	data[IWM_RX_RING_COUNT];
+	uint_t			cur;
+};
+
+/* Raw firmware ownership only; not an accepted executable firmware image. */
+struct iwm_fw_info {
+	void	*data;
+	size_t	size;
+};
+
+struct iwm_cfg {
+	uint16_t	vendor;
+	uint16_t	device;
+	uint16_t	subvendor;
+	uint16_t	subdevice;
+	uint8_t		revision;
+	uint_t		family;
+	size_t		fw_dma_size;
+	size_t		nvm_section_size;
+	const char	*fwname;
+};
+
+struct iwm_softc {
+	dev_info_t		*dip;
+	const struct iwm_cfg	*cfg;
+	ieee80211com_t		ic;
+	ddi_acc_handle_t		pcih;
+	ddi_acc_handle_t		regh;
+	caddr_t			regs;
+	off_t			regsize;
+	ddi_intr_handle_t	intr;
+	uint_t			intr_pri;
+	kmutex_t		lock;
+	struct iwm_fw_info	fw;
+};
+
+/*
+ * These native transport helpers are not called by attach.  Their caller
+ * must hold exclusive lifecycle ownership, run in thread context and have
+ * stopped device DMA before releasing mappings.  No sleeping allocation may
+ * run under an interrupt mutex.  No MAC/net80211 callbacks are registered.
+ */
+int iwm_pci_map(struct iwm_softc *);
+void iwm_pci_unmap(struct iwm_softc *);
+int iwm_reg_read(struct iwm_softc *, uint_t, uint32_t *);
+int iwm_reg_write(struct iwm_softc *, uint_t, uint32_t);
+int iwm_dma_alloc(struct iwm_softc *, struct iwm_dma_info *, size_t,
+    uint_t, uint_t);
+int iwm_dma_free(struct iwm_dma_info *);
+int iwm_fw_read(struct iwm_fw_info *);
+void iwm_fw_free(struct iwm_fw_info *);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* _IF_IWMVAR_H */
