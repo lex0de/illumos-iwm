@@ -146,7 +146,7 @@ enum iwm_proto_reason {
 	IWM_PROTO_RX_SHORT, IWM_PROTO_RX_LENGTH, IWM_PROTO_COMMAND_ID,
 	IWM_PROTO_NO_COMMAND, IWM_PROTO_QUEUE, IWM_PROTO_SEQUENCE,
 	IWM_PROTO_NVM_SHORT, IWM_PROTO_RESPONSE_SIZE, IWM_PROTO_FH_TX,
-	IWM_PROTO_NVM_SECTION, IWM_PROTO_NVM_OFFSET, IWM_PROTO_NVM_STATUS,
+	IWM_PROTO_NVM_OFFSET, IWM_PROTO_NVM_STATUS,
 	IWM_PROTO_NVM_COUNT, IWM_PROTO_NVM_LENGTH, IWM_PROTO_NVM_ZERO,
 	IWM_PROTO_COMMAND_GROUP
 };
@@ -167,7 +167,7 @@ struct iwm_proto_diag {
 	uint_t section;
 	uint_t offset;
 	uint_t requested;
-	uint_t actual_section;
+	uint_t actual_type;
 	uint_t actual_offset;
 	uint_t count;
 	uint_t status;
@@ -216,8 +216,6 @@ iwm_nvm_check(const struct iwm_proto_diag *d)
 	/* A failed firmware read has no success metadata or data body. */
 	if (d->status != 0)
 		return (IWM_PROTO_NVM_STATUS);
-	if (d->actual_section != d->section)
-		return (IWM_PROTO_NVM_SECTION);
 	if (d->actual_offset != d->offset)
 		return (IWM_PROTO_NVM_OFFSET);
 	if (d->count == 0)
@@ -265,9 +263,6 @@ struct iwm_runtime {
 	struct iwm_dma_info tx[IWM_MAX_QUEUES];
 	struct iwm_dma_info commands;
 	struct iwm_dma_info rx[IWM_RX_RING_COUNT];
-	uint8_t rx_pre[IWM_RX_RING_COUNT][sizeof (struct iwm_nvm_access_resp)];
-	size_t rx_pre_offset[IWM_RX_RING_COUNT];
-	uint32_t rx_generation[IWM_RX_RING_COUNT];
 	uint8_t *nvm[IWM_NVM_NUM_OF_SECTIONS];
 	size_t nvm_len[IWM_NVM_NUM_OF_SECTIONS];
 	uint8_t mac[6];
@@ -289,8 +284,8 @@ iwm_proto_report(struct iwm_softc *sc, const struct iwm_proto_diag *d)
 	static const char * const names[] = {
 		"ok", "alive-layout", "rx-index", "rx-short", "rx-length",
 		"command-id", "no-command", "command-queue", "command-index",
-		"nvm-short", "response-size", "fh-tx-state", "nvm-section",
-		"nvm-offset", "nvm-status", "nvm-count", "nvm-length",
+		"nvm-short", "response-size", "fh-tx-state", "nvm-offset",
+		"nvm-status", "nvm-count", "nvm-length",
 		"nvm-zero", "command-group"
 	};
 
@@ -306,8 +301,8 @@ iwm_proto_report(struct iwm_softc *sc, const struct iwm_proto_diag *d)
 	    d->sequence & 0xff, IWM_NVM_ACCESS_CMD, d->expected_sequence,
 	    d->pending, (ulong_t)d->payload);
 	dev_err(sc->dip, CE_NOTE, "!iwm protocol nvm-header-valid=%u "
-	    "section=%u/%u offset=%u/%u count=%u/requested=%u status=%u",
-	    d->nvm_valid, d->actual_section, d->section,
+	    "type=%u requested=%u offset=%u/%u count=%u/requested=%u status=%u",
+	    d->nvm_valid, d->actual_type, d->section,
 	    d->actual_offset, d->offset, d->count, d->requested, d->status);
 }
 
@@ -874,9 +869,7 @@ iwm_u32(const uint8_t *p)
 }
 
 static void
-iwm_notification(struct iwm_softc *sc, const uint8_t *p, size_t length,
-    const uint8_t *pre, size_t payload_offset, size_t pre_offset,
-    uint32_t generation)
+iwm_notification(struct iwm_softc *sc, const uint8_t *p, size_t length)
 {
 	struct iwm_runtime *r = sc->run;
 	uint_t code = p[0] | (uint_t)p[1] << 8;
@@ -893,28 +886,6 @@ iwm_notification(struct iwm_softc *sc, const uint8_t *p, size_t length,
 	d->expected_sequence = r->cmdqid << 8 | r->cmdcur;
 	d->pending = r->command_pending;
 	d->payload = n;
-	/* Decode only a complete fixed header. */
-	if (code == IWM_NVM_ACCESS_CMD &&
-	    n >= sizeof (struct iwm_nvm_access_resp)) {
-		dev_err(sc->dip, CE_NOTE, "!iwm nvm-wire rx=%u generation=%u "
-		    "offset=%lu "
-		    "header=%02x %02x %02x %02x payload=%02x %02x %02x %02x "
-		    "%02x %02x %02x %02x", r->rxcur, generation,
-		    (ulong_t)payload_offset, p[0], p[1], p[2], p[3], data[0],
-		    data[1], data[2], data[3], data[4], data[5], data[6],
-		    data[7]);
-		dev_err(sc->dip, CE_NOTE, "!iwm nvm-pre rx=%u generation=%u "
-		    "offset=%lu bytes=%02x %02x %02x %02x %02x %02x %02x %02x",
-		    r->rxcur, generation, (ulong_t)pre_offset, pre[0], pre[1],
-		    pre[2], pre[3], pre[4], pre[5], pre[6], pre[7]);
-		d->nvm_valid = B_TRUE;
-		d->actual_offset = iwm_u16(data);
-		d->count = iwm_u16(data + 2);
-		d->actual_section = iwm_u16(data + 4);
-		d->status = iwm_u16(data + 6);
-	}
-	if (r->command_pending)
-		iwm_proto_report(sc, d);
 
 	if (code == IWM_ALIVE) {
 		if (r->alive || r->state != IWM_INIT_UPLOAD ||
@@ -949,6 +920,15 @@ iwm_notification(struct iwm_softc *sc, const uint8_t *p, size_t length,
 		iwm_proto_error(sc, reason);
 		return;
 	}
+	/* Decode the fixed header after command ownership checks. */
+	if (code == IWM_NVM_ACCESS_CMD) {
+		d->nvm_valid = B_TRUE;
+		d->actual_offset = iwm_u16(data);
+		d->count = iwm_u16(data + 2);
+		d->actual_type = iwm_u16(data + 4);
+		d->status = iwm_u16(data + 6);
+	}
+	iwm_proto_report(sc, d);
 	bcopy(data, r->response, n);
 	r->response_len = n;
 	r->response_diagnostic = *d;
@@ -971,7 +951,7 @@ iwm_notifications(struct iwm_softc *sc)
 	d->raw = 0;
 	d->length = d->available = d->payload = 0;
 	d->code = d->sequence = 0;
-	d->actual_section = d->actual_offset = d->count = d->status = 0;
+	d->actual_type = d->actual_offset = d->count = d->status = 0;
 	d->rxcur = r->rxcur;
 	if (iwm_sync(&sc->dma[3], DDI_DMA_SYNC_FORCPU) != 0) {
 		r->error = EIO;
@@ -985,9 +965,6 @@ iwm_notifications(struct iwm_softc *sc)
 	}
 	while (r->rxcur != hw && count++ < IWM_RX_RING_COUNT && r->error == 0) {
 		struct iwm_dma_info *dma = &r->rx[r->rxcur];
-		size_t payload_offset, pre_offset, capture_offset = 0;
-		boolean_t capture_valid = B_FALSE;
-		uint32_t generation;
 
 		if (iwm_sync(dma, DDI_DMA_SYNC_FORCPU) != 0) {
 			r->error = EIO;
@@ -1004,7 +981,7 @@ iwm_notifications(struct iwm_softc *sc)
 			d->nvm_valid = B_FALSE;
 			d->code = d->sequence = 0;
 			d->payload = 0;
-			d->actual_section = d->actual_offset = 0;
+			d->actual_type = d->actual_offset = 0;
 			d->count = d->status = 0;
 			d->rxcur = r->rxcur;
 			d->raw = raw;
@@ -1015,27 +992,13 @@ iwm_notifications(struct iwm_softc *sc)
 				iwm_proto_error(sc, reason);
 				break;
 			}
-			pre_offset = r->rx_pre_offset[r->rxcur];
-			generation = r->rx_generation[r->rxcur];
-			payload_offset = off + 8;
-			capture_offset = payload_offset;
-			capture_valid = B_TRUE;
-			iwm_notification(sc, p + off + 4, length,
-			    r->rx_pre[r->rxcur], payload_offset, pre_offset,
-			    generation);
+			iwm_notification(sc, p + off + 4, length);
 			advance = P2ROUNDUP(length + 4,
 			    IWM_FH_RSCSR_FRAME_ALIGN);
 			if (r->error != 0 || advance > IWM_RBUF_SIZE - off)
 				break;
 		}
-		if (capture_valid && capture_offset <= IWM_RBUF_SIZE -
-		    sizeof (struct iwm_nvm_access_resp)) {
-			r->rx_pre_offset[r->rxcur] = capture_offset;
-			bcopy(p + capture_offset, r->rx_pre[r->rxcur],
-			    sizeof (struct iwm_nvm_access_resp));
-		}
 		bzero(p, IWM_RBUF_SIZE);
-		r->rx_generation[r->rxcur]++;
 		if (iwm_sync(dma, DDI_DMA_SYNC_FORDEV) != 0)
 			r->error = EIO;
 		r->rxcur = (r->rxcur + 1) % IWM_RX_RING_COUNT;
@@ -1132,11 +1095,6 @@ iwm_nvm_chunk(struct iwm_softc *sc, uint_t section, uint_t offset,
 	/* Preserve the offset instead of the donor's unconditional zero. */
 	nvm->offset = LE_16(offset);
 	nvm->length = LE_16(requested);
-	dev_err(sc->dip, CE_NOTE, "!iwm nvm-request section=%u bytes=%02x "
-	    "%02x %02x %02x %02x %02x %02x %02x", section,
-	    ((uint8_t *)nvm)[0], ((uint8_t *)nvm)[1], ((uint8_t *)nvm)[2],
-	    ((uint8_t *)nvm)[3], ((uint8_t *)nvm)[4], ((uint8_t *)nvm)[5],
-	    ((uint8_t *)nvm)[6], ((uint8_t *)nvm)[7]);
 	addr = iwm_dma_addr(&r->commands) + r->cmdcur * sizeof (*cmd);
 	low = LE_32((uint32_t)addr);
 	bcopy(&low, &desc->tbs[0].lo, sizeof (low));
@@ -1181,7 +1139,7 @@ iwm_nvm_chunk(struct iwm_softc *sc, uint_t section, uint_t offset,
 	r->diagnostic = r->response_diagnostic;
 	r->diagnostic.actual_offset = iwm_u16(r->response);
 	r->diagnostic.count = iwm_u16(r->response + 2);
-	r->diagnostic.actual_section = iwm_u16(r->response + 4);
+	r->diagnostic.actual_type = iwm_u16(r->response + 4);
 	r->diagnostic.status = iwm_u16(r->response + 6);
 	r->diagnostic.payload = r->response_len;
 	r->diagnostic.nvm_valid = B_TRUE;
@@ -1499,7 +1457,6 @@ iwm_run_alloc(struct iwm_softc *sc)
 		if (iwm_dma_alloc(sc, &r->rx[i], IWM_RBUF_SIZE,
 		    256, DDI_DMA_READ) != 0)
 			return (ENOMEM);
-		r->rx_pre_offset[i] = 8;
 		desc[i] = LE_32((uint32_t)(iwm_dma_addr(&r->rx[i]) >> 8));
 	}
 	/* End the allocator's host-side test sync before device publication. */
