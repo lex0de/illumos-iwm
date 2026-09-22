@@ -1,9 +1,11 @@
 /* BEGIN CSTYLED */
-/*	$OpenBSD: if_iwmvar.h,v 1.79 2025/12/01 16:30:46 stsp Exp $	*/
+/*	$OpenBSD: if_iwm.c,v 1.419 2025/12/01 16:30:46 stsp Exp $	*/
 
 /*
- * Copyright (c) 2014 genua mbh <info@genua.de>
+ * Copyright (c) 2014, 2016 genua gmbh <info@genua.de>
+ *   Author: Stefan Sperling <stsp@openbsd.org>
  * Copyright (c) 2014 Fixup Software Ltd.
+ * Copyright (c) 2017 Stefan Sperling <stsp@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -22,9 +24,6 @@
  * Based on BSD-licensed source modules in the Linux iwlwifi driver,
  * which were used as the reference documentation for this implementation.
  *
- * Driver version we are currently based off of is
- * Linux 3.14.3 (tag id a2df521e42b1d9a23f620ac79dbfe8655a8391dd)
- *
  ***********************************************************************
  *
  * This file is provided under a dual BSD/GPLv2 license.  When using or
@@ -33,6 +32,8 @@
  * GPL LICENSE SUMMARY
  *
  * Copyright(c) 2007 - 2013 Intel Corporation. All rights reserved.
+ * Copyright(c) 2013 - 2015 Intel Mobile Communications GmbH
+ * Copyright(c) 2016 Intel Deutschland GmbH
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of version 2 of the GNU General Public License as
@@ -59,6 +60,8 @@
  * BSD LICENSE
  *
  * Copyright(c) 2005 - 2013 Intel Corporation. All rights reserved.
+ * Copyright(c) 2013 - 2015 Intel Mobile Communications GmbH
+ * Copyright(c) 2016 Intel Deutschland GmbH
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -108,150 +111,54 @@
 
 /*
  * Copyright 2026 lex0de <lex0de@tuta.com>
- * Preserve the original donor licence notices above verbatim.
+ * API 36 image metadata derived from the pinned OpenBSD iwm definitions.
+ * Byte parsing is independent of kernel allocation and device access.
  */
+#ifndef _IF_IWMFW_H
+#define	_IF_IWMFW_H
 
-/*
- * Derived from OpenBSD sys/dev/pci/if_iwmvar.h at
- * 0efabb066d34187a404f31d303b3b97103df1117, BSD licence option.
- * The ring shape and 8000-family limits are retained.  OS-owned resources
- * use illumos types.  No aggregation, radiotap or other device families.
- */
-#ifndef _IF_IWMVAR_H
-#define	_IF_IWMVAR_H
-
-#include <sys/ddi.h>
-#include <sys/sunddi.h>
-#include <sys/net80211.h>
-#include <io/iwm/if_iwmreg.h>
-#include <io/iwm/if_iwmfw.h>
+#include <sys/types.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define	IWM_TX_RING_COUNT	256
-#define	IWM_RX_RING_COUNT	256
-#define	IWM_RBUF_SIZE		4096
-#define	IWM_FWDMASEGSZ_8000	(320 * 1024)
-#define	IWM_DEVICE_FAMILY_8000	2
-#define	IWM_UCODE_SECT_MAX	16
+#define	IWM_FW_SECTIONS	16
+#define	IWM_FW_IMAGES	3
+#define	IWM_FW_INIT	1
+#define	IWM_FW_CPU_SEPARATOR	0xffffccccU
+#define	IWM_FW_PAGING_SEPARATOR	0xaaaabbbbU
 
-/* Explicit handle/memory/binding ownership; stop DMA before releasing. */
-struct iwm_dma_info {
-	ddi_dma_handle_t	dma_hdl;
-	ddi_acc_handle_t	acc_hdl;
-	ddi_dma_cookie_t	cookie;
-	caddr_t		vaddr;
+struct iwm_fw_section {
+	const uint8_t	*data;
+	uint32_t	offset;
 	size_t		length;
+};
+
+struct iwm_fw_image {
+	uint_t		count;
+	struct iwm_fw_section section[IWM_FW_SECTIONS];
+};
+
+struct iwm_fw_info {
+	void		*data;
 	size_t		size;
-	boolean_t	allocated;
-	boolean_t	memory;
-	boolean_t	bound;
+	uint32_t	version[3];
+	uint32_t	api[4];
+	uint32_t	capa[4];
+	uint32_t	flags;
+	uint32_t	phy_config;
+	uint32_t	paging_size;
+	uint32_t	cpu_count;
+	uint32_t	cmd_version_count;
+	uint8_t		cmd_versions[1024];
+	struct iwm_fw_image image[IWM_FW_IMAGES];
 };
 
-struct iwm_tx_data {
-	struct iwm_dma_info	dma;
-	mblk_t			*mp;
-	struct ieee80211_node	*ni;
-};
-
-struct iwm_tx_ring {
-	struct iwm_dma_info	desc_dma;
-	struct iwm_dma_info	cmd_dma;
-	struct iwm_tfd		*desc;
-	struct iwm_device_cmd	*cmd;
-	struct iwm_tx_data	data[IWM_TX_RING_COUNT];
-	uint_t			qid;
-	uint_t			queued;
-	uint_t			cur;
-	uint_t			tail;
-};
-
-struct iwm_rx_ring {
-	struct iwm_dma_info	desc_dma;
-	struct iwm_dma_info	stat_dma;
-	uint32_t		*desc;
-	struct iwm_rb_status	*stat;
-	struct iwm_dma_info	data[IWM_RX_RING_COUNT];
-	uint_t			cur;
-};
-
-struct iwm_cfg {
-	uint16_t	vendor;
-	uint16_t	device;
-	uint16_t	subvendor;
-	uint16_t	subdevice;
-	uint8_t		revision;
-	uint_t		family;
-	size_t		fw_dma_size;
-	size_t		nvm_section_size;
-	boolean_t	nvm_external;
-	const char	*fwname;
-};
-
-#define	IWM_SILICON_C_STEP	2
-#define	IWM_PASSIVE_DMA_COUNT	4
-
-struct iwm_softc {
-	dev_info_t		*dip;
-	const struct iwm_cfg	*cfg;
-	ieee80211com_t		ic;
-	ddi_acc_handle_t		pcih;
-	ddi_acc_handle_t		regh;
-	caddr_t			regs;
-	off_t			regsize;
-	ddi_intr_handle_t	intr;
-	uint_t			intr_pri;
-	int			intr_types;
-	int			intr_cap;
-	boolean_t		intr_allocated;
-	boolean_t		intr_added;
-	boolean_t		intr_enabled;
-	boolean_t		lock_initialized;
-	boolean_t		csr_valid;
-	boolean_t		attached;
-	boolean_t		intr_fault;
-	uint32_t		intr_calls;
-	uint32_t		hw_rev;
-	uint32_t		gp_cntrl;
-	uint16_t		pci_command;
-	uint16_t		pcie_cap;
-	uint16_t		msi_cap;
-	uint16_t		pm_cap;
-	int			fail_step;
-	int			attach_step;
-	kmutex_t		lock;
-	struct iwm_dma_info	dma[IWM_PASSIVE_DMA_COUNT];
-	struct iwm_fw_info	fw;
-	struct iwm_runtime	*run;
-};
-
-/*
- * Attach/detach own resources in thread context. The lock serializes firmware
- * state, completion predicates and register windows with the MSI handler.
- * Bounded CV waits release it; allocations and host interrupt operations run
- * outside it. Stop device DMA before releasing published mappings, then
- * disable/remove the handler before destroying its lock or BAR.
- */
-int iwm_pci_map(struct iwm_softc *);
-void iwm_pci_unmap(struct iwm_softc *);
-int iwm_reg_read(struct iwm_softc *, uint_t, uint32_t *);
-int iwm_reg_write(struct iwm_softc *, uint_t, uint32_t);
-int iwm_dma_alloc(struct iwm_softc *, struct iwm_dma_info *, size_t,
-    uint_t, uint_t);
-int iwm_dma_free(struct iwm_dma_info *);
-int iwm_fw_read(struct iwm_softc *);
-int iwm_checkpoint(struct iwm_softc *, const char *);
-int iwm_intr_disable(struct iwm_softc *);
-int iwm_init_nvm(struct iwm_softc *);
-int iwm_run_free(struct iwm_softc *);
-int iwm_run_quiesce(struct iwm_softc *);
-uint_t iwm_active_intr(struct iwm_softc *, uint32_t, uint32_t);
-void iwm_fw_free(struct iwm_fw_info *);
+int iwm_fw_parse(struct iwm_fw_info *);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* _IF_IWMVAR_H */
+#endif /* _IF_IWMFW_H */

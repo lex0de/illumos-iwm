@@ -14,14 +14,17 @@
 #
 
 UTSBASE		= ../..
+FWDIR		= $(UTSBASE)/common/io/iwm/fw-iw
+FWFILES		= iwm-8000C-36
 MODULE		= iwm
 OBJECTS		= $(IWM_OBJS:%=$(OBJS_DIR)/%)
 ROOTMODULE	= $(ROOT_DRV_DIR)/$(MODULE)
+ROOTFIRMWARE	= $(FWFILES:%=$(ROOT_FIRMWARE_DIR)/$(MODULE)/%)
 
 include $(UTSBASE)/intel/Makefile.intel
 
 ALL_TARGET	= $(BINARY)
-INSTALL_TARGET	= $(BINARY) $(ROOTMODULE)
+INSTALL_TARGET	= $(BINARY) $(ROOTMODULE) $(ROOTFIRMWARE)
 
 # Only mac_init_ops/mac_fini_ops are called.  firmload is part of genunix.
 # Add net80211 when the driver actually registers with the wireless stack.
@@ -36,6 +39,10 @@ clobber:	$(CLOBBER_DEPS)
 install:	$(INSTALL_DEPS)
 
 check:
+	$(CSTYLE) -pP $(UTSBASE)/common/io/iwm/if_iwmfw.c
+	$(CSTYLE) -pP $(UTSBASE)/common/io/iwm/if_iwmhw.c
+	$(CSTYLE) -pP $(UTSBASE)/common/io/iwm/if_iwmfw.h
+	$(HDRCHK) $(UTSBASE)/common/io/iwm/if_iwmfw.h
 	$(CSTYLE) -pP $(UTSBASE)/common/io/iwm/if_iwm.c
 	$(CSTYLE) -pP $(UTSBASE)/common/io/iwm/if_iwmreg.h
 	$(CSTYLE) -pP $(UTSBASE)/common/io/iwm/if_iwmvar.h

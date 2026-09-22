@@ -20,9 +20,9 @@
  * the accompanying headers.  This file contains native illumos integration,
  * not an implementation of OpenBSD kernel interfaces.
  *
- * Passive attachment only: no NIC start, firmware operation, DMA publication
- * or MAC registration.  Device interrupt causes stay masked.  One MSI host
- * handle is enabled briefly, then disabled before attach completes.
+ * Passive attach by default. The iwm-init-nvm property opts into one bounded
+ * INIT firmware/NVM cycle, stopped before attach returns. No MAC registration
+ * or network data path exists.
  */
 
 #include <sys/types.h>
@@ -60,7 +60,6 @@ static const struct iwm_cfg iwm_8260 = {
 static void *iwm_state;
 static uint32_t iwm_retained;
 
-static int iwm_checkpoint(struct iwm_softc *, const char *);
 static int iwm_cleanup(struct iwm_softc *);
 
 /* Only recognised causes may be acknowledged by the dormant handler. */
@@ -74,7 +73,7 @@ static int iwm_cleanup(struct iwm_softc *);
 	IWM_CSR_FH_INT_BIT_RX_CHNL0 | IWM_CSR_FH_INT_BIT_TX_CHNL1 | \
 	IWM_CSR_FH_INT_BIT_TX_CHNL0)
 
-/* Real future control objects, allocated but never published to the NIC. */
+/* Passive control allocations; INIT may publish keep-warm and RX state. */
 static const struct {
 	const char *name;
 	size_t size;
@@ -98,7 +97,7 @@ static const ddi_device_acc_attr_t iwm_dma_attr = {
 };
 
 /* Inject test failure after a successful ownership transition. */
-static int
+int
 iwm_checkpoint(struct iwm_softc *sc, const char *name)
 {
 	if (++sc->attach_step != sc->fail_step)
@@ -324,12 +323,13 @@ iwm_dma_free(struct iwm_dma_info *dma)
 /*
  * Read raw bytes in thread context with exclusive ownership of fw.  Success
  * means file I/O only.  TLV parsing, version/capability validation and device
- * transfer are deliberately absent; this buffer must not be sent to a NIC.
+ * transfer require successful validation by iwm_fw_parse().
  * The filename resolves to kernel/firmware/iwm/iwm-8000C-36 through firmload.
  */
 int
-iwm_fw_read(struct iwm_fw_info *fw)
+iwm_fw_read(struct iwm_softc *sc)
 {
+	struct iwm_fw_info *fw = &sc->fw;
 	firmware_handle_t handle;
 	off_t size;
 	int error;
@@ -339,6 +339,10 @@ iwm_fw_read(struct iwm_fw_info *fw)
 	error = firmware_open("iwm", iwm_8260.fwname, &handle);
 	if (error != 0)
 		return (error);
+	if (iwm_checkpoint(sc, "firmware-open") != 0) {
+		(void) firmware_close(handle);
+		return (EIO);
+	}
 	size = firmware_get_size(handle);
 	if (size < sizeof (struct iwm_tlv_ucode_header) ||
 	    size > IWM_FW_FILE_MAX) {
@@ -347,7 +351,9 @@ iwm_fw_read(struct iwm_fw_info *fw)
 	}
 	fw->size = (size_t)size;
 	fw->data = kmem_zalloc(fw->size, KM_SLEEP);
-	error = firmware_read(handle, 0, fw->data, fw->size);
+	error = iwm_checkpoint(sc, "firmware-memory");
+	if (error == 0)
+		error = firmware_read(handle, 0, fw->data, fw->size);
 	(void) firmware_close(handle);
 	if (error != 0) {
 		iwm_fw_free(fw);
@@ -361,8 +367,7 @@ iwm_fw_free(struct iwm_fw_info *fw)
 {
 	if (fw->data != NULL)
 		kmem_free(fw->data, fw->size);
-	fw->data = NULL;
-	fw->size = 0;
+	bzero(fw, sizeof (*fw));
 }
 
 /* A read after the mask write flushes posted MMIO before host enable. */
@@ -426,6 +431,14 @@ iwm_intr(caddr_t arg, caddr_t unused)
 	_NOTE(ARGUNUSED(unused));
 	mutex_enter(&sc->lock);
 	sc->intr_calls++;
+	if (sc->run != NULL) {
+		(void) iwm_mask(sc);
+		(void) iwm_reg_read(sc, IWM_CSR_INT, &causes);
+		(void) iwm_reg_read(sc, IWM_CSR_FH_INT_STATUS, &fh);
+		result = iwm_active_intr(sc, causes, fh);
+		mutex_exit(&sc->lock);
+		return (result);
+	}
 	(void) iwm_mask(sc);
 	if (iwm_reg_read(sc, IWM_CSR_INT, &causes) == 0 &&
 	    iwm_reg_read(sc, IWM_CSR_FH_INT_STATUS, &fh) == 0 &&
@@ -483,7 +496,7 @@ iwm_intr_open(struct iwm_softc *sc)
 	return (iwm_checkpoint(sc, "interrupt-handler"));
 }
 
-static int
+int
 iwm_intr_disable(struct iwm_softc *sc)
 {
 	int error;
@@ -532,8 +545,8 @@ iwm_intr_test(struct iwm_softc *sc)
 }
 
 /*
- * No address was published and the handler never touches DMA memory.  Keep
- * any resource whose release fails, and prevent module removal while its
+ * Stop the runtime transport before releasing passive resources. Keep any
+ * resource whose release fails, and prevent module removal while its
  * soft state remains.  A cleanup failure requires operator investigation;
  * it must never become a use-after-free or a forced removal.
  */
@@ -544,6 +557,8 @@ iwm_cleanup(struct iwm_softc *sc)
 	int mask_error = 0;
 	uint16_t command;
 
+	if (iwm_run_free(sc) != 0)
+		return (EIO);
 	if (sc->csr_valid && iwm_mask(sc) != 0)
 		mask_error = EIO;
 	if (iwm_intr_disable(sc) != 0)
@@ -599,7 +614,7 @@ iwm_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	ddi_set_driver_private(dip, sc);
 	sc->fail_step = ddi_prop_get_int(DDI_DEV_T_ANY, dip,
 	    DDI_PROP_DONTPASS, "iwm-attach-fail", 0);
-	if (sc->fail_step < 0 || sc->fail_step > 25 ||
+	if (sc->fail_step < 0 || sc->fail_step > 4096 ||
 	    iwm_checkpoint(sc, "soft-state") != 0 ||
 	    iwm_pci_map(sc) != 0 || iwm_passive_csr(sc) != 0 ||
 	    iwm_intr_open(sc) != 0)
@@ -618,14 +633,17 @@ iwm_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	command = pci_config_get16(sc->pcih, PCI_CONF_COMM);
 	if ((command ^ sc->pci_command) & PCI_COMM_ME)
 		goto fail;
+	if (ddi_prop_get_int(DDI_DEV_T_ANY, dip, DDI_PROP_DONTPASS,
+	    "iwm-init-nvm", 0) != 0 && iwm_init_nvm(sc) != 0)
+		goto fail;
 	sc->attached = B_TRUE;
-	dev_err(dip, CE_NOTE, "!iwm passive attach complete, %d checkpoints; "
-	    "PCI command=%04x; no firmware, DMA publication or MAC",
+	dev_err(dip, CE_NOTE, "!iwm attach complete, %d checkpoints; "
+	    "PCI command=%04x; no MAC",
 	    sc->attach_step, command);
 	return (DDI_SUCCESS);
 
 fail:
-	dev_err(dip, CE_WARN, "!iwm passive attach failed at step %d",
+	dev_err(dip, CE_WARN, "!iwm attach failed at step %d",
 	    sc->attach_step);
 	if (iwm_cleanup(sc) != 0) {
 		/* Pin the retained handler's devinfo until recovery reboot. */
@@ -655,7 +673,7 @@ iwm_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
 	}
 	ddi_set_driver_private(dip, NULL);
 	ddi_soft_state_free(iwm_state, ddi_get_instance(dip));
-	dev_err(dip, CE_NOTE, "!iwm passive detach complete");
+	dev_err(dip, CE_NOTE, "!iwm detach complete");
 	return (DDI_SUCCESS);
 }
 
@@ -664,12 +682,11 @@ iwm_quiesce(dev_info_t *dip)
 {
 	struct iwm_softc *sc = ddi_get_driver_private(dip);
 
-	/* No locks, waits, interrupt teardown or mapping teardown here. */
-	if (sc == NULL || !sc->attached || !sc->csr_valid ||
+	/* No locks, sleeping, interrupt teardown or mapping teardown here. */
+	if (sc == NULL || !sc->csr_valid ||
 	    iwm_mask(sc) != 0)
 		return (DDI_FAILURE);
-	/* No engines were started and no DMA address was ever published. */
-	return (DDI_SUCCESS);
+	return (iwm_run_quiesce(sc) == 0 ? DDI_SUCCESS : DDI_FAILURE);
 }
 
 DDI_DEFINE_STREAM_OPS(iwm_devops, nulldev, nulldev, iwm_attach,
@@ -677,7 +694,7 @@ DDI_DEFINE_STREAM_OPS(iwm_devops, nulldev, nulldev, iwm_attach,
 
 static struct modldrv iwm_modldrv = {
 	&mod_driverops,
-	"Intel 8260 passive transport",
+	"Intel 8260 INIT transport",
 	&iwm_devops
 };
 
