@@ -522,13 +522,11 @@ iwm_start(struct iwm_softc *sc)
 		iwm_nic_unlock(sc);
 		return (EIO);
 	}
-	dev_err(sc->dip, CE_NOTE, "!iwm 8000 AUX=%08x", step);
 	step = (step >> IWM_HW_STEP_LOCATION_BITS) & 0xf;
 	if (step == 3)
 		r->hw_rev = (r->hw_rev & 0xfffffff3) |
 		    (IWM_SILICON_C_STEP << 2);
 	iwm_nic_unlock(sc);
-	dev_err(sc->dip, CE_NOTE, "!iwm adjusted HW_REV=%08x", r->hw_rev);
 	iwm_wr(sc, IWM_CSR_RESET, IWM_CSR_RESET_REG_FLAG_SW_RESET);
 	drv_usecwait(5000);
 	if ((error = iwm_apm(sc)) != 0)
@@ -563,23 +561,32 @@ iwm_queues_check(struct iwm_softc *sc, const char *boundary)
 		return (EBUSY);
 	for (q = 0; q < IWM_MAX_QUEUES; q++) {
 		base = iwm_rd(sc, IWM_FH_MEM_CBBC_QUEUE(q));
-		if (base != iwm_dma_addr(&r->tx[q]) >> 8)
+		if (base != iwm_dma_addr(&r->tx[q]) >> 8) {
 			error = EIO;
+			dev_err(sc->dip, CE_WARN, "!iwm %s q%u base=%08x "
+			    "expected=%08x", boundary, q, base,
+			    (uint32_t)(iwm_dma_addr(&r->tx[q]) >> 8));
+		}
 		rd = iwm_prph_read(sc, IWM_SCD_QUEUE_RDPTR(q));
 		wr = iwm_prph_read(sc, IWM_SCD_QUEUE_WRPTR(q));
 		status = iwm_prph_read(sc, IWM_SCD_QUEUE_STATUS_BITS(q));
-		dev_err(sc->dip, CE_NOTE, "!iwm %s q%u rd=%08x wr=%08x "
-		    "status=%08x", boundary, q, rd, wr, status);
 		if (q == r->cmdqid)
 			continue;
 		if (rd != 0 || wr != 0 ||
-		    (status & (1 << IWM_SCD_QUEUE_STTS_REG_POS_ACTIVE)))
+		    (status & (1 << IWM_SCD_QUEUE_STTS_REG_POS_ACTIVE))) {
 			error = EIO;
+			dev_err(sc->dip, CE_WARN, "!iwm %s unused q%u "
+			    "rd=%08x wr=%08x status=%08x", boundary, q, rd,
+			    wr, status);
+		}
 		if (iwm_sync(&r->tx[q], DDI_DMA_SYNC_FORCPU) != 0)
 			error = EIO;
 		for (i = 0; i < r->tx[q].size; i++) {
 			if (r->tx[q].vaddr[i] != 0) {
 				error = EIO;
+				dev_err(sc->dip, CE_WARN,
+				    "!iwm %s unused q%u descriptor data at "
+				    "byte %u", boundary, q, i);
 				break;
 			}
 		}
@@ -733,9 +740,6 @@ iwm_upload(struct iwm_softc *sc)
 			bits = 1;
 			continue;
 		}
-		dev_err(sc->dip, CE_NOTE, "!iwm INIT section %u CPU%u "
-		    "offset=%08x bytes=%lu", i, cpu + 1, s->offset,
-		    (ulong_t)s->length);
 		for (pos = 0; pos < s->length; pos += length) {
 			length = MIN(s->length - pos, IWM_FH_MEM_TB_MAX_LENGTH);
 			offset = s->offset + pos;
@@ -876,7 +880,6 @@ iwm_notification(struct iwm_softc *sc, const uint8_t *p, size_t length)
 	uint_t idx = p[2], qid = p[3];
 	const uint8_t *data = p + 4;
 	size_t n = length - 4;
-	uint_t i;
 	enum iwm_proto_reason reason;
 	struct iwm_proto_diag *d = &r->diagnostic;
 
@@ -897,13 +900,13 @@ iwm_notification(struct iwm_softc *sc, const uint8_t *p, size_t length)
 		}
 		r->alive_len = n;
 		bcopy(data, r->alive_data, n);
-		for (i = 0; i < n; i += 4)
-			dev_err(sc->dip, CE_NOTE, "!iwm ALIVE word%u=%08x",
-			    i / 4, iwm_u32(data + i));
 		if (iwm_u16(data) != IWM_ALIVE_STATUS_OK) {
 			r->error = EIO;
 			return;
 		}
+		dev_err(sc->dip, CE_NOTE,
+		    "!iwm INIT ALIVE status=%04x length=%lu", iwm_u16(data),
+		    (ulong_t)n);
 		/* All three donor ALIVE layouts place SCD at byte 40. */
 		r->sched_base = iwm_u32(data + 40);
 		r->alive = B_TRUE;
@@ -928,7 +931,6 @@ iwm_notification(struct iwm_softc *sc, const uint8_t *p, size_t length)
 		d->actual_type = iwm_u16(data + 4);
 		d->status = iwm_u16(data + 6);
 	}
-	iwm_proto_report(sc, d);
 	bcopy(data, r->response, n);
 	r->response_len = n;
 	r->response_diagnostic = *d;
@@ -1027,10 +1029,7 @@ iwm_active_intr(struct iwm_softc *sc, uint32_t causes, uint32_t fh)
 	r->fh_causes |= fh;
 	r->diagnostic.interrupt = causes;
 	r->diagnostic.fh = fh;
-	if (++r->interrupt_count <= 1024)
-		dev_err(sc->dip, CE_NOTE,
-		    "!iwm firmware interrupt csr=%08x fh=%08x", causes, fh);
-	else
+	if (++r->interrupt_count > 1024)
 		r->error = EOVERFLOW;
 	iwm_wr(sc, IWM_CSR_INT, causes);
 	iwm_wr(sc, IWM_CSR_FH_INT_STATUS, fh);
@@ -1122,12 +1121,6 @@ iwm_nvm_chunk(struct iwm_softc *sc, uint_t section, uint_t offset,
 	r->diagnostic.requested = requested;
 	r->diagnostic.expected_sequence = r->cmdqid << 8 | r->cmdcur;
 	r->diagnostic.pending = B_TRUE;
-	dev_err(sc->dip, CE_NOTE, "!iwm NVM request section=%u offset=%u "
-	    "length=%u opcode=%02x group=0 version=0 target=%u operation=%u "
-	    "q=%u idx=%u sequence=%04x producer=%u", section, offset,
-	    requested, cmd->hdr.code, nvm->target, nvm->op_code,
-	    r->cmdqid, r->cmdcur, r->diagnostic.expected_sequence,
-	    (r->cmdcur + 1) % IWM_TX_RING_COUNT);
 	/* No external input or packet can select a queue. */
 	iwm_wr(sc, IWM_HBUS_TARG_WRPTR,
 	    r->cmdqid << 8 | ((r->cmdcur + 1) % IWM_TX_RING_COUNT));
@@ -1147,7 +1140,6 @@ iwm_nvm_chunk(struct iwm_softc *sc, uint_t section, uint_t offset,
 	if (reason == IWM_PROTO_NVM_STATUS) {
 		/* Failed sections are absent; fields are not success data. */
 		r->diagnostic.reason = reason;
-		iwm_proto_report(sc, &r->diagnostic);
 		dev_err(sc->dip, CE_NOTE, "!iwm NVM section%u read failed "
 		    "status=%u; section remains absent", section,
 		    r->diagnostic.status);
@@ -1241,8 +1233,6 @@ iwm_nvm_parse(struct iwm_softc *sc)
 	    r->mac[0], r->mac[1], r->mac[2], r->mac[3], r->mac[4], r->mac[5]);
 	for (i = 0; i < sizeof (channels); i++) {
 		r->channels[i] = iwm_u16(r->nvm[3] + 2 * i);
-		dev_err(sc->dip, CE_NOTE, "!iwm NVM channel%u flags=%04x "
-		    "observation only", channels[i], r->channels[i]);
 	}
 	r->state = IWM_NVM_PARSED;
 	return (iwm_checkpoint(sc, "NVM-parsed"));
@@ -1487,7 +1477,6 @@ iwm_init_nvm(struct iwm_softc *sc)
 {
 	struct iwm_runtime *r;
 	int error, stop_error, host_error;
-	uint_t i;
 
 	ASSERT(sc->run == NULL);
 	r = kmem_zalloc(sizeof (*r), KM_SLEEP);
@@ -1508,9 +1497,6 @@ iwm_init_nvm(struct iwm_softc *sc)
 	    "command-q=%u PHY=%08x timeout=%u us", sc->fw.version[0],
 	    sc->fw.version[1], sc->fw.version[2], r->cmdqid,
 	    sc->fw.phy_config, IWM_WAIT_US);
-	for (i = 0; i < 4; i++)
-		dev_err(sc->dip, CE_NOTE, "!iwm API[%u]=%08x CAPA[%u]=%08x",
-		    i, sc->fw.api[i], i, sc->fw.capa[i]);
 	if ((error = iwm_run_alloc(sc)) != 0)
 		return (error);
 	if (sc->intr_cap & DDI_INTR_FLAG_BLOCK)
