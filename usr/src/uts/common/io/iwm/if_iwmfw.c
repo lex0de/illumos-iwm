@@ -153,7 +153,7 @@ iwm_fw_section(struct iwm_fw_info *fw, uint_t image, const uint8_t *p,
 /*
  * Restrict uploads to the authenticated 8000C INIT layout. Separators carry
  * metadata bytes, not upload data. Paging sections are recorded but INIT
- * does not enable paging in the pinned donor. No REGULAR selection exists.
+ * does not enable paging. REGULAR has a separate layout check below.
  */
 static int
 iwm_fw_init_layout(struct iwm_fw_info *fw)
@@ -175,6 +175,32 @@ iwm_fw_init_layout(struct iwm_fw_info *fw)
 	}
 	if (im->section[5].length != 32 || im->section[10].length != 4 ||
 	    im->section[12].length != fw->paging_size)
+		return (EINVAL);
+	return (0);
+}
+
+/* REGULAR uses eight upload sections and a bounded host paging image. */
+static int
+iwm_fw_regular_layout(struct iwm_fw_info *fw)
+{
+	static const uint32_t offsets[] = {
+		0x00404000, 0x00800000, 0, 0x00448000,
+		IWM_FW_CPU_SEPARATOR, 0x00405000, 0xc0080000,
+		0xc0880000, 0x80458000, IWM_FW_PAGING_SEPARATOR,
+		0x00440000, 0x01000000
+	};
+	struct iwm_fw_image *im = &fw->image[IWM_FW_REGULAR];
+	uint_t i;
+
+	if (im->count != sizeof (offsets) / sizeof (offsets[0]))
+		return (EINVAL);
+	for (i = 0; i < im->count; i++) {
+		if (im->section[i].offset != offsets[i])
+			return (EINVAL);
+	}
+	if (im->section[4].length != 32 || im->section[9].length != 4 ||
+	    im->section[10].length > 4096 || fw->paging_size == 0 ||
+	    im->section[11].length != fw->paging_size)
 		return (EINVAL);
 	return (0);
 }
@@ -209,7 +235,7 @@ iwm_fw_parse(struct iwm_fw_info *fw)
 		if (len > left)
 			return (EINVAL);
 		switch (type) {
-		case 19: /* SEC_RT: metadata only, never executable here. */
+		case 19: /* SEC_RT */
 		case 20: /* SEC_INIT */
 		case 21: /* SEC_WOWLAN: metadata only. */
 			error = iwm_fw_section(fw, type - 19, p, len);
@@ -230,9 +256,14 @@ iwm_fw_parse(struct iwm_fw_info *fw)
 				return (EINVAL);
 			fw->flags = iwm_fw_u32(p);
 			break;
-		case 22: /* DEF_CALIB: no calibration command in this phase. */
-			if (len != 12 || iwm_fw_u32(p) >= IWM_FW_IMAGES)
+		case 22: /* DEF_CALIB, per-image firmware calibration masks. */
+			if (len != 12 ||
+			    (index = iwm_fw_u32(p)) >= IWM_FW_IMAGES ||
+			    fw->image[index].calib_valid)
 				return (EINVAL);
+			fw->image[index].calib_flow = iwm_fw_u32(p + 4);
+			fw->image[index].calib_event = iwm_fw_u32(p + 8);
+			fw->image[index].calib_valid = B_TRUE;
 			break;
 		case 23: /* PHY_SKU */
 			if (len != 4 || phy)
@@ -308,5 +339,10 @@ iwm_fw_parse(struct iwm_fw_info *fw)
 	    fw->version[0] != 36 || fw->version[1] != 0xca7b901d ||
 	    fw->version[2] != 0)
 		return (EINVAL);
-	return (iwm_fw_init_layout(fw));
+	if (!fw->image[IWM_FW_INIT].calib_valid ||
+	    !fw->image[IWM_FW_REGULAR].calib_valid)
+		return (EINVAL);
+	if ((error = iwm_fw_init_layout(fw)) != 0)
+		return (error);
+	return (iwm_fw_regular_layout(fw));
 }

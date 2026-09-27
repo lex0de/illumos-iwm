@@ -125,6 +125,7 @@ extern "C" {
 
 #define	IWM_FW_SECTIONS	16
 #define	IWM_FW_IMAGES	3
+#define	IWM_FW_REGULAR	0
 #define	IWM_FW_INIT	1
 #define	IWM_FW_CPU_SEPARATOR	0xffffccccU
 #define	IWM_FW_PAGING_SEPARATOR	0xaaaabbbbU
@@ -137,6 +138,9 @@ struct iwm_fw_section {
 
 struct iwm_fw_image {
 	uint_t		count;
+	uint32_t	calib_flow;
+	uint32_t	calib_event;
+	boolean_t	calib_valid;
 	struct iwm_fw_section section[IWM_FW_SECTIONS];
 };
 

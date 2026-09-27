@@ -111,7 +111,7 @@
 
 /*
  * Copyright 2026 lex0de <lex0de@tuta.com>
- * 8260 INIT-only transport derived from OpenBSD sys/dev/pci/if_iwm.c,
+ * 8260 firmware transport derived from OpenBSD sys/dev/pci/if_iwm.c,
  * 0efabb066d34187a404f31d303b3b97103df1117, BSD licence option.
  * Native DDI ownership, bounded completion waits and no wireless-stack calls.
  */
@@ -133,11 +133,32 @@
 #define	IWM_NVM_LIMIT	32768
 #define	IWM_NVM_CHUNK	2048
 #define	IWM_WAIT_US	1000000
+#define	IWM_CALIB_US	2000000
+#define	IWM_PHY_DB_GROUPS	9
+#define	IWM_PHY_DB_ENTRIES	(2 + 2 * IWM_PHY_DB_GROUPS)
+#define	IWM_INIT_COMPLETE_NOTIF	0x04
+#define	IWM_PHY_CONFIGURATION_CMD	0x6a
+#define	IWM_CALIB_RES_NOTIF_PHY_DB	0x6b
+#define	IWM_PHY_DB_CMD	0x6c
+#define	IWM_TX_ANT_CONFIGURATION_CMD	0x98
+#define	IWM_REPLY_SF_CFG_CMD	0xd1
+#define	IWM_PAGING_CMD	0x14f
+#define	IWM_DQA_ENABLE_CMD	0x500
+#define	IWM_TEMP_THRESHOLDS_CMD	0x404
+#define	IWM_CAPA_CT_KILL_BY_FW	74
+#define	IWM_PHY_DB_CFG	1
+#define	IWM_PHY_DB_CALIB_NCH	2
+#define	IWM_PHY_DB_CALIB_CHG_PAPD	4
+#define	IWM_PHY_DB_CALIB_CHG_TXP	5
+#define	IWM_PAGING_BLOCK_SIZE	32768
+#define	IWM_PAGING_BLOCKS	33
 
 enum iwm_fw_state {
 	IWM_FW_CLOSED, IWM_FW_LOADED, IWM_FW_PARSED, IWM_CARD_PREPARED,
 	IWM_INIT_UPLOAD, IWM_INIT_ALIVE, IWM_NVM_READING, IWM_NVM_PARSED,
-	IWM_DEVICE_STOPPING, IWM_DEVICE_STOPPED
+	IWM_INIT_CALIBRATING, IWM_PHY_DB_COMPLETE, IWM_IMAGE_STOPPING,
+	IWM_IMAGE_STOPPED, IWM_REGULAR_UPLOAD, IWM_REGULAR_ALIVE,
+	IWM_REGULAR_IDLE, IWM_DEVICE_STOPPING, IWM_DEVICE_STOPPED
 };
 
 /* Stable rejection identifiers; values are retained until runtime cleanup. */
@@ -148,7 +169,7 @@ enum iwm_proto_reason {
 	IWM_PROTO_NVM_SHORT, IWM_PROTO_RESPONSE_SIZE, IWM_PROTO_FH_TX,
 	IWM_PROTO_NVM_OFFSET, IWM_PROTO_NVM_STATUS,
 	IWM_PROTO_NVM_COUNT, IWM_PROTO_NVM_LENGTH, IWM_PROTO_NVM_ZERO,
-	IWM_PROTO_COMMAND_GROUP
+	IWM_PROTO_COMMAND_GROUP, IWM_PROTO_PHY_DB, IWM_PROTO_INIT_STATE
 };
 
 struct iwm_proto_diag {
@@ -164,6 +185,7 @@ struct iwm_proto_diag {
 	uint_t code;
 	uint_t sequence;
 	uint_t expected_sequence;
+	uint_t expected_code;
 	uint_t section;
 	uint_t offset;
 	uint_t requested;
@@ -227,6 +249,11 @@ iwm_nvm_check(const struct iwm_proto_diag *d)
 	return (IWM_PROTO_OK);
 }
 
+struct iwm_phy_entry {
+	uint8_t *data;
+	size_t length;
+};
+
 struct iwm_runtime {
 	struct iwm_proto_diag diagnostic;
 	struct iwm_proto_diag first_error;
@@ -273,6 +300,18 @@ struct iwm_runtime {
 	uint8_t rx_ant;
 	uint16_t channels[51];
 	uint16_t lar;
+	boolean_t full_cycle;
+	uint_t image;
+	uint_t generation;
+	uint_t expected_code;
+	boolean_t control_command;
+	boolean_t init_complete;
+	boolean_t calib_complete;
+	uint_t phy_notifications;
+	struct iwm_phy_entry phy_db[IWM_PHY_DB_ENTRIES];
+	struct iwm_dma_info paging[IWM_PAGING_BLOCKS];
+	uint_t paging_blocks;
+	uint_t paging_last;
 };
 
 static uint16_t iwm_u16(const uint8_t *);
@@ -286,7 +325,7 @@ iwm_proto_report(struct iwm_softc *sc, const struct iwm_proto_diag *d)
 		"command-id", "no-command", "command-queue", "command-index",
 		"nvm-short", "response-size", "fh-tx-state", "nvm-offset",
 		"nvm-status", "nvm-count", "nvm-length",
-		"nvm-zero", "command-group"
+		"nvm-zero", "command-group", "phy-db", "init-state"
 	};
 
 	dev_err(sc->dip, CE_NOTE, "!iwm protocol reason=%s(%u) "
@@ -295,10 +334,10 @@ iwm_proto_report(struct iwm_softc *sc, const struct iwm_proto_diag *d)
 	    d->rxcur, d->rxhw, d->raw, (ulong_t)d->length,
 	    (ulong_t)d->available);
 	dev_err(sc->dip, CE_NOTE, "!iwm protocol packet-valid=%u "
-	    "code=%04x sequence=%04x q=%u idx=%u expected-code=%02x "
+	    "code=%04x sequence=%04x q=%u idx=%u expected-code=%04x "
 	    "expected-sequence=%04x pending=%u payload=%lu",
 	    d->packet_valid, d->code, d->sequence, d->sequence >> 8,
-	    d->sequence & 0xff, IWM_NVM_ACCESS_CMD, d->expected_sequence,
+	    d->sequence & 0xff, d->expected_code, d->expected_sequence,
 	    d->pending, (ulong_t)d->payload);
 	dev_err(sc->dip, CE_NOTE, "!iwm protocol nvm-header-valid=%u "
 	    "type=%u requested=%u offset=%u/%u count=%u/requested=%u status=%u",
@@ -699,14 +738,15 @@ static int
 iwm_upload(struct iwm_softc *sc)
 {
 	struct iwm_runtime *r = sc->run;
-	struct iwm_fw_image *im = &sc->fw.image[IWM_FW_INIT];
+	struct iwm_fw_image *im = &sc->fw.image[r->image];
 	uint_t i, cpu = 0, bits = 1;
 	size_t pos, length;
 	uint32_t offset, status;
 	uint64_t addr = iwm_dma_addr(&r->transfer);
 	int error;
 
-	r->state = IWM_INIT_UPLOAD;
+	r->state = r->image == IWM_FW_INIT ?
+	    IWM_INIT_UPLOAD : IWM_REGULAR_UPLOAD;
 	r->alive = B_FALSE;
 	iwm_wr(sc, IWM_CSR_INT, 0xffffffff);
 	iwm_wr(sc, IWM_CSR_UCODE_DRV_GP1_CLR,
@@ -794,17 +834,21 @@ iwm_upload(struct iwm_softc *sc)
 		    status | (bits << (cpu * 16)));
 		bits = (bits << 1) | 1;
 		iwm_nic_unlock(sc);
-		if (iwm_checkpoint(sc, "INIT-section") != 0)
+		if (iwm_checkpoint(sc, r->image == IWM_FW_INIT ?
+		    "INIT-section" : "REGULAR-section") != 0)
 			return (EIO);
 	}
 	r->mask = IWM_RUN_MASK;
 	iwm_wr(sc, IWM_CSR_INT_MASK, r->mask);
-	dev_err(sc->dip, CE_NOTE, "!iwm INIT upload complete; ALIVE wait %u us",
-	    IWM_WAIT_US);
+	dev_err(sc->dip, CE_NOTE,
+	    "!iwm image=%u upload complete; ALIVE wait %u us",
+	    r->image, IWM_WAIT_US);
 	if ((error = iwm_wait(sc, &r->alive)) != 0)
 		return (error);
-	r->state = IWM_INIT_ALIVE;
-	if (iwm_checkpoint(sc, "INIT-ALIVE") != 0)
+	r->state = r->image == IWM_FW_INIT ?
+	    IWM_INIT_ALIVE : IWM_REGULAR_ALIVE;
+	if (iwm_checkpoint(sc, r->image == IWM_FW_INIT ?
+	    "INIT-ALIVE" : "REGULAR-ALIVE") != 0)
 		return (EIO);
 	return (iwm_queues_check(sc, "after-ALIVE"));
 }
@@ -872,6 +916,87 @@ iwm_u32(const uint8_t *p)
 	    (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24);
 }
 
+/* Validate the complete fixed PHY DB header before using its group index. */
+static int
+iwm_phy_index(const uint8_t *data, size_t length, uint_t *slot,
+    size_t *size)
+{
+	uint_t type, group;
+
+	if (length < 4)
+		return (EPROTO);
+	type = iwm_u16(data);
+	*size = iwm_u16(data + 2);
+	if (*size == 0 || *size > length - 4)
+		return (EPROTO);
+	if (type == IWM_PHY_DB_CFG || type == IWM_PHY_DB_CALIB_NCH) {
+		*slot = type - 1;
+		return (0);
+	}
+	if ((type != IWM_PHY_DB_CALIB_CHG_PAPD &&
+	    type != IWM_PHY_DB_CALIB_CHG_TXP) || *size < 2)
+		return (EPROTO);
+	group = iwm_u16(data + 4);
+	if (group >= IWM_PHY_DB_GROUPS ||
+	    (type == IWM_PHY_DB_CALIB_CHG_TXP && *size < 6))
+		return (EPROTO);
+	*slot = 2 + (type - IWM_PHY_DB_CALIB_CHG_PAPD) *
+	    IWM_PHY_DB_GROUPS + group;
+	return (0);
+}
+
+/* Interrupt context, sc->lock held. Replacement never loses ownership. */
+static void
+iwm_phy_notification(struct iwm_softc *sc, const uint8_t *data, size_t n)
+{
+	struct iwm_runtime *r = sc->run;
+	struct iwm_phy_entry *entry;
+	uint8_t *copy;
+	size_t size;
+	uint_t slot;
+
+	if (r->state != IWM_INIT_CALIBRATING || r->image != IWM_FW_INIT) {
+		iwm_proto_error(sc, IWM_PROTO_INIT_STATE);
+		return;
+	}
+	if (iwm_phy_index(data, n, &slot, &size) != 0) {
+		iwm_proto_error(sc, IWM_PROTO_PHY_DB);
+		return;
+	}
+	copy = kmem_alloc(size, KM_NOSLEEP);
+	if (copy == NULL) {
+		r->error = ENOMEM;
+		return;
+	}
+	bcopy(data + 4, copy, size);
+	entry = &r->phy_db[slot];
+	if (entry->data != NULL)
+		kmem_free(entry->data, entry->length);
+	entry->data = copy;
+	entry->length = size;
+	r->calib_complete = B_TRUE;
+	r->phy_notifications++;
+	if (iwm_checkpoint(sc, "PHY-DB-record") != 0)
+		r->error = EIO;
+}
+
+/* Both firmware completion and independently validated data are required. */
+static boolean_t
+iwm_calibration_complete(const struct iwm_runtime *r)
+{
+	uint_t i;
+	boolean_t papd = B_FALSE, txp = B_FALSE;
+
+	if (!r->init_complete || !r->calib_complete ||
+	    r->phy_db[0].length == 0 || r->phy_db[1].length == 0)
+		return (B_FALSE);
+	for (i = 0; i < IWM_PHY_DB_GROUPS; i++) {
+		papd |= r->phy_db[2 + i].length != 0;
+		txp |= r->phy_db[2 + IWM_PHY_DB_GROUPS + i].length != 0;
+	}
+	return (papd && txp);
+}
+
 static void
 iwm_notification(struct iwm_softc *sc, const uint8_t *p, size_t length)
 {
@@ -887,11 +1012,14 @@ iwm_notification(struct iwm_softc *sc, const uint8_t *p, size_t length)
 	d->code = code;
 	d->sequence = qid << 8 | idx;
 	d->expected_sequence = r->cmdqid << 8 | r->cmdcur;
+	d->expected_code = r->control_command ?
+	    r->expected_code : IWM_NVM_ACCESS_CMD;
 	d->pending = r->command_pending;
 	d->payload = n;
 
 	if (code == IWM_ALIVE) {
-		if (r->alive || r->state != IWM_INIT_UPLOAD ||
+		if (r->alive || (r->state != IWM_INIT_UPLOAD &&
+		    r->state != IWM_REGULAR_UPLOAD) ||
 		    (n != sizeof (struct iwm_alive_resp_v1) &&
 		    n != sizeof (struct iwm_alive_resp_v2) &&
 		    n != sizeof (struct iwm_alive_resp_v3))) {
@@ -905,16 +1033,53 @@ iwm_notification(struct iwm_softc *sc, const uint8_t *p, size_t length)
 			return;
 		}
 		dev_err(sc->dip, CE_NOTE,
-		    "!iwm INIT ALIVE status=%04x length=%lu", iwm_u16(data),
-		    (ulong_t)n);
+		    "!iwm image=%u ALIVE status=%04x length=%lu",
+		    r->image, iwm_u16(data), (ulong_t)n);
 		/* All three donor ALIVE layouts place SCD at byte 40. */
 		r->sched_base = iwm_u32(data + 40);
+		dev_err(sc->dip, CE_NOTE, "!iwm ALIVE scd=%08x error=%08x "
+		    "log=%08x version=%08x/%08x umac-error=%08x",
+		    r->sched_base, iwm_u32(data + 20), iwm_u32(data + 24),
+		    n == sizeof (struct iwm_alive_resp_v3) ?
+		    iwm_u32(data + 8) : data[5],
+		    n == sizeof (struct iwm_alive_resp_v3) ?
+		    iwm_u32(data + 4) : data[4],
+		    n == sizeof (struct iwm_alive_resp_v3) ?
+		    iwm_u32(data + 60) :
+		    n == sizeof (struct iwm_alive_resp_v2) ?
+		    iwm_u32(data + 56) : 0);
 		r->alive = B_TRUE;
 		return;
 	}
 	if (code == IWM_MFUART_LOAD_NOTIFICATION) {
 		dev_err(sc->dip, CE_NOTE, "!iwm MFUART notification bytes=%lu",
 		    (ulong_t)n);
+		return;
+	}
+	if (code == IWM_CALIB_RES_NOTIF_PHY_DB) {
+		iwm_phy_notification(sc, data, n);
+		return;
+	}
+	if (code == IWM_INIT_COMPLETE_NOTIF) {
+		if (r->state != IWM_INIT_CALIBRATING ||
+		    r->image != IWM_FW_INIT || r->init_complete) {
+			iwm_proto_error(sc, IWM_PROTO_INIT_STATE);
+			return;
+		}
+		r->init_complete = B_TRUE;
+		return;
+	}
+	if (r->control_command) {
+		if (code != r->expected_code || !r->command_pending ||
+		    qid != r->cmdqid || idx != r->cmdcur ||
+		    n > sizeof (r->response)) {
+			iwm_proto_error(sc, code != r->expected_code ?
+			    IWM_PROTO_COMMAND_ID : IWM_PROTO_SEQUENCE);
+			return;
+		}
+		bcopy(data, r->response, n);
+		r->response_len = n;
+		r->command_done = B_TRUE;
 		return;
 	}
 	reason = iwm_command_check(code, r->command_pending,
@@ -1039,7 +1204,8 @@ iwm_active_intr(struct iwm_softc *sc, uint32_t causes, uint32_t fh)
 		r->error = EIO;
 	} else {
 		if (causes & IWM_CSR_INT_BIT_FH_TX) {
-			if (r->state != IWM_INIT_UPLOAD || r->chunk_done)
+			if ((r->state != IWM_INIT_UPLOAD &&
+			    r->state != IWM_REGULAR_UPLOAD) || r->chunk_done)
 				iwm_proto_error(sc, IWM_PROTO_FH_TX);
 			else
 				r->chunk_done = B_TRUE;
@@ -1059,6 +1225,148 @@ iwm_active_intr(struct iwm_softc *sc, uint32_t causes, uint32_t fh)
 	iwm_wr(sc, IWM_CSR_INT_MASK, r->mask);
 	cv_broadcast(&r->cv);
 	return (DDI_INTR_CLAIMED);
+}
+
+/*
+ * Serialized non-packet command. The transfer buffer is reusable only after
+ * upload completion; it remains device-owned until the matching response.
+ */
+static int
+iwm_control(struct iwm_softc *sc, uint_t code, const void *data, size_t size)
+{
+	struct iwm_runtime *r = sc->run;
+	struct iwm_tfd *tfd = (void *)r->tx[r->cmdqid].vaddr;
+	struct iwm_agn_scd_bc_tbl *bc = (void *)r->scheduler.vaddr;
+	uint8_t *header;
+	uint64_t addr;
+	uint32_t low;
+	uint16_t value, bytes;
+	uint_t hlen;
+	int error;
+
+	hlen = (code >> 8) != 0 ? 8 : 4;
+	if (!r->alive || r->command_pending || r->error != 0 ||
+	    size == 0 || size > 4095 - hlen ||
+	    r->transfer.size < hlen || size > r->transfer.size - hlen)
+		return (EINVAL);
+	tfd += r->cmdcur;
+	bzero(tfd, sizeof (*tfd));
+	header = (uint8_t *)r->transfer.vaddr;
+	bzero(header, hlen);
+	header[0] = code & 0xff;
+	header[1] = code >> 8;
+	header[2] = r->cmdcur;
+	header[3] = r->cmdqid;
+	if (hlen == 8) {
+		value = LE_16(size);
+		bcopy(&value, header + 4, sizeof (value));
+	}
+	bcopy(data, header + hlen, size);
+	addr = iwm_dma_addr(&r->transfer);
+	low = LE_32((uint32_t)addr);
+	bcopy(&low, &tfd->tbs[0].lo, sizeof (low));
+	tfd->tbs[0].hi_n_len = LE_16((addr >> 32) | ((hlen + size) << 4));
+	tfd->num_tbs = 1;
+	bytes = IWM_TX_CRC_SIZE + IWM_TX_DELIMITER_SIZE;
+	if (sc->fw.flags & IWM_UCODE_TLV_FLAGS_DW_BC_TABLE)
+		bytes /= 4;
+	bc[r->cmdqid].tfd_offset[r->cmdcur] = LE_16(bytes);
+	if (r->cmdcur < IWM_TFD_QUEUE_SIZE_BC_DUP)
+		bc[r->cmdqid].tfd_offset[IWM_TFD_QUEUE_SIZE_MAX + r->cmdcur] =
+		    LE_16(bytes);
+	if (iwm_sync(&r->scheduler, DDI_DMA_SYNC_FORDEV) != 0 ||
+	    iwm_sync(&r->transfer, DDI_DMA_SYNC_FORDEV) != 0 ||
+	    iwm_sync(&r->tx[r->cmdqid], DDI_DMA_SYNC_FORDEV) != 0)
+		return (EIO);
+	r->control_command = B_TRUE;
+	r->expected_code = code;
+	r->command_done = B_FALSE;
+	r->command_pending = B_TRUE;
+	r->response_len = 0;
+	iwm_wr(sc, IWM_HBUS_TARG_WRPTR,
+	    r->cmdqid << 8 | ((r->cmdcur + 1) % IWM_TX_RING_COUNT));
+	error = iwm_wait(sc, &r->command_done);
+	r->command_pending = B_FALSE;
+	if (error == 0) {
+		r->cmdcur = (r->cmdcur + 1) % IWM_TX_RING_COUNT;
+		r->control_command = B_FALSE;
+	}
+	return (error);
+}
+
+static int
+iwm_tx_ant_config(struct iwm_softc *sc)
+{
+	uint32_t mask = (sc->fw.phy_config >> 16) & 7;
+
+	mask &= sc->run->tx_ant;
+	if (mask == 0)
+		return (EINVAL);
+	mask = LE_32(mask);
+	return (iwm_control(sc, IWM_TX_ANT_CONFIGURATION_CMD,
+	    &mask, sizeof (mask)));
+}
+
+static int
+iwm_phy_config(struct iwm_softc *sc)
+{
+	struct iwm_fw_image *image = &sc->fw.image[sc->run->image];
+	uint32_t command[3];
+
+	command[0] = LE_32(sc->fw.phy_config);
+	command[1] = LE_32(image->calib_flow);
+	command[2] = LE_32(image->calib_event);
+	return (iwm_control(sc, IWM_PHY_CONFIGURATION_CMD,
+	    command, sizeof (command)));
+}
+
+static int
+iwm_calibrate(struct iwm_softc *sc)
+{
+	struct iwm_runtime *r = sc->run;
+	uint32_t sf[23];
+	uint_t i;
+	clock_t deadline;
+	int error;
+
+	if ((iwm_rd(sc, IWM_CSR_GP_CNTRL) &
+	    IWM_CSR_GP_CNTRL_REG_FLAG_HW_RF_KILL_SW) == 0)
+		return (EPERM);
+	/* Donor SF_INIT_OFF, unassociated default watermarks and timers. */
+	bzero(sf, sizeof (sf));
+	sf[0] = LE_32(3);
+	sf[1] = LE_32(4096);
+	sf[2] = LE_32(8192);
+	for (i = 3; i < 13; i++)
+		sf[i] = LE_32(1000000);
+	for (i = 13; i < 23; i += 2) {
+		sf[i] = LE_32(400);
+		sf[i + 1] = LE_32(160);
+	}
+	if ((error = iwm_control(sc, IWM_REPLY_SF_CFG_CMD,
+	    sf, sizeof (sf))) != 0 || (error = iwm_tx_ant_config(sc)) != 0)
+		return (error);
+	r->state = IWM_INIT_CALIBRATING;
+	if ((error = iwm_phy_config(sc)) != 0)
+		return (error);
+	if (iwm_checkpoint(sc, "INIT-calibration-command") != 0)
+		return (EIO);
+	deadline = ddi_get_lbolt() + drv_usectohz(IWM_CALIB_US);
+	while (!iwm_calibration_complete(r) && r->error == 0) {
+		if (cv_timedwait(&r->cv, &sc->lock, deadline) < 0)
+			return (ETIMEDOUT);
+	}
+	if (r->error != 0)
+		return (r->error);
+	if (!iwm_calibration_complete(r))
+		return (EPROTO);
+	for (i = 0; i < IWM_PHY_DB_ENTRIES; i++)
+		dev_err(sc->dip, CE_NOTE, "!iwm PHY DB slot=%u length=%lu",
+		    i, (ulong_t)r->phy_db[i].length);
+	r->state = IWM_PHY_DB_COMPLETE;
+	dev_err(sc->dip, CE_NOTE, "!iwm INIT calibration complete, %u records",
+	    r->phy_notifications);
+	return (iwm_checkpoint(sc, "INIT-calibration-complete"));
 }
 
 static int
@@ -1278,7 +1586,7 @@ iwm_nvm(struct iwm_softc *sc)
  * Timeout is a failure, never permission to release memory still owned by NIC.
  */
 static int
-iwm_device_stop(struct iwm_softc *sc)
+iwm_device_stop(struct iwm_softc *sc, boolean_t final)
 {
 	struct iwm_runtime *r = sc->run;
 	uint_t ch;
@@ -1287,11 +1595,14 @@ iwm_device_stop(struct iwm_softc *sc)
 
 	if (r->stop_failed)
 		return (EIO);
-	if (!r->touched || r->stopped)
+	if (!r->touched || r->stopped) {
+		if (final)
+			r->state = IWM_DEVICE_STOPPED;
 		return (0);
+	}
 	if (r->published && iwm_queues_check(sc, "pre-stop") != 0)
 		r->error = EIO;
-	r->state = IWM_DEVICE_STOPPING;
+	r->state = final ? IWM_DEVICE_STOPPING : IWM_IMAGE_STOPPING;
 	r->mask = 0;
 	iwm_wr(sc, IWM_CSR_INT_MASK, 0);
 	(void) iwm_rd(sc, IWM_CSR_INT_MASK);
@@ -1353,8 +1664,179 @@ iwm_device_stop(struct iwm_softc *sc)
 		return (error);
 	}
 	r->stopped = B_TRUE;
-	r->state = IWM_DEVICE_STOPPED;
+	r->state = final ? IWM_DEVICE_STOPPED : IWM_IMAGE_STOPPED;
 	return (0);
+}
+
+/* Hardware stopped; retain host allocations and firmware/NVM/PHY data. */
+static int
+iwm_restart(struct iwm_softc *sc)
+{
+	struct iwm_runtime *r = sc->run;
+	uint_t i;
+	int error;
+
+	if (r->command_pending || r->error != 0)
+		return (EBUSY);
+	error = iwm_device_stop(sc, B_FALSE);
+	if (error != 0)
+		return (error);
+	mutex_exit(&sc->lock);
+	error = iwm_intr_disable(sc);
+	mutex_enter(&sc->lock);
+	if (error != 0 || r->error != 0 || r->nic_locks != 0)
+		return (EIO);
+	if (iwm_checkpoint(sc, "inter-image-stop") != 0)
+		return (EIO);
+	for (i = 0; i < IWM_RX_RING_COUNT; i++) {
+		if (iwm_sync(&r->rx[i], DDI_DMA_SYNC_FORCPU) != 0)
+			return (EIO);
+		bzero(r->rx[i].vaddr, r->rx[i].size);
+		if (iwm_sync(&r->rx[i], DDI_DMA_SYNC_FORDEV) != 0)
+			return (EIO);
+	}
+	for (i = 0; i < IWM_MAX_QUEUES; i++) {
+		if (iwm_sync(&r->tx[i], DDI_DMA_SYNC_FORCPU) != 0)
+			return (EIO);
+		bzero(r->tx[i].vaddr, r->tx[i].size);
+		if (iwm_sync(&r->tx[i], DDI_DMA_SYNC_FORDEV) != 0)
+			return (EIO);
+	}
+	if (iwm_sync(&sc->dma[3], DDI_DMA_SYNC_FORCPU) != 0)
+		return (EIO);
+	bzero(sc->dma[3].vaddr, sc->dma[3].size);
+	bzero(r->commands.vaddr, r->commands.size);
+	bzero(r->scheduler.vaddr, r->scheduler.size);
+	if (iwm_sync(&sc->dma[3], DDI_DMA_SYNC_FORDEV) != 0 ||
+	    iwm_sync(&r->commands, DDI_DMA_SYNC_FORDEV) != 0 ||
+	    iwm_sync(&r->scheduler, DDI_DMA_SYNC_FORDEV) != 0 ||
+	    iwm_sync(&sc->dma[2], DDI_DMA_SYNC_FORDEV) != 0)
+		return (EIO);
+	r->cmdcur = r->rxcur = 0;
+	r->command_done = r->chunk_done = B_FALSE;
+	r->control_command = r->command_pending = B_FALSE;
+	r->response_len = 0;
+	bzero(r->response, sizeof (r->response));
+	bzero(&r->diagnostic, sizeof (r->diagnostic));
+	bzero(&r->response_diagnostic, sizeof (r->response_diagnostic));
+	bzero(r->alive_data, sizeof (r->alive_data));
+	r->alive_len = 0;
+	r->sched_base = 0;
+	r->tx_started = r->rx_started = r->published = B_FALSE;
+	r->image = IWM_FW_REGULAR;
+	r->generation++;
+	/* Old callbacks have drained and RX is reset before MSI is enabled. */
+	if (sc->intr_cap & DDI_INTR_FLAG_BLOCK)
+		error = ddi_intr_block_enable(&sc->intr, 1);
+	else
+		error = ddi_intr_enable(sc->intr);
+	if (error != DDI_SUCCESS)
+		return (EIO);
+	sc->intr_enabled = B_TRUE;
+	r->stopped = B_FALSE;
+	if ((error = iwm_start(sc)) != 0 ||
+	    (error = iwm_transport_init(sc)) != 0)
+		return (error);
+	return (iwm_checkpoint(sc, "restarted-transport"));
+}
+
+static int
+iwm_paging_alloc(struct iwm_softc *sc)
+{
+	struct iwm_runtime *r = sc->run;
+	struct iwm_fw_image *im = &sc->fw.image[IWM_FW_REGULAR];
+	uint_t i;
+	size_t size, copied = 0, used;
+	const uint8_t *data = im->section[11].data;
+
+	r->paging_blocks = (sc->fw.paging_size + IWM_PAGING_BLOCK_SIZE - 1) /
+	    IWM_PAGING_BLOCK_SIZE;
+	if (r->paging_blocks == 0 || r->paging_blocks >= IWM_PAGING_BLOCKS)
+		return (EINVAL);
+	r->paging_last = (sc->fw.paging_size -
+	    (r->paging_blocks - 1) * IWM_PAGING_BLOCK_SIZE) / 4096;
+	for (i = 0; i <= r->paging_blocks; i++) {
+		size = i == 0 ? 4096 : IWM_PAGING_BLOCK_SIZE;
+		if (iwm_dma_alloc(sc, &r->paging[i], size, 4096,
+		    DDI_DMA_RDWR) != 0)
+			return (ENOMEM);
+		/* Copy only the declared CSS bytes. */
+		used = i == 0 ? im->section[10].length :
+		    MIN(sc->fw.paging_size - copied, size);
+		bzero(r->paging[i].vaddr, size);
+		bcopy(i == 0 ? im->section[10].data : data + copied,
+		    r->paging[i].vaddr, used);
+		if (i != 0)
+			copied += used;
+		if (iwm_sync(&r->paging[i], DDI_DMA_SYNC_FORDEV) != 0)
+			return (EIO);
+	}
+	return (copied == sc->fw.paging_size ? 0 : EINVAL);
+}
+
+static int
+iwm_regular_config(struct iwm_softc *sc)
+{
+	struct iwm_runtime *r = sc->run;
+	uint32_t paging[3 + IWM_PAGING_BLOCKS];
+	uint32_t dqa;
+	uint8_t thermal[20];
+	uint8_t phy[IWM_RBUF_SIZE];
+	uint16_t value;
+	uint_t i, type;
+	int error;
+
+	bzero(paging, sizeof (paging));
+	paging[0] = LE_32((1U << 9) | (1U << 8) | r->paging_last);
+	paging[1] = LE_32(15);
+	paging[2] = LE_32(r->paging_blocks);
+	for (i = 0; i <= r->paging_blocks; i++)
+		paging[3 + i] = LE_32(iwm_dma_addr(&r->paging[i]) >> 12);
+	if ((error = iwm_control(sc, IWM_PAGING_CMD,
+	    paging, sizeof (paging))) != 0)
+		return (error);
+	if (iwm_checkpoint(sc, "REGULAR-first-command") != 0)
+		return (EIO);
+	if ((error = iwm_tx_ant_config(sc)) != 0)
+		return (error);
+	for (i = 0; i < IWM_PHY_DB_ENTRIES; i++) {
+		struct iwm_phy_entry *entry = &r->phy_db[i];
+
+		if (entry->length == 0)
+			continue;
+		if (entry->length > sizeof (phy) - 4)
+			return (EOVERFLOW);
+		type = i < 2 ? i + 1 : i < 2 + IWM_PHY_DB_GROUPS ?
+		    IWM_PHY_DB_CALIB_CHG_PAPD : IWM_PHY_DB_CALIB_CHG_TXP;
+		value = LE_16(type);
+		bcopy(&value, phy, 2);
+		value = LE_16(entry->length);
+		bcopy(&value, phy + 2, 2);
+		bcopy(entry->data, phy + 4, entry->length);
+		if ((error = iwm_control(sc, IWM_PHY_DB_CMD,
+		    phy, entry->length + 4)) != 0)
+			return (error);
+		if (iwm_checkpoint(sc, "PHY-DB-replay") != 0)
+			return (EIO);
+	}
+	if ((error = iwm_phy_config(sc)) != 0)
+		return (error);
+	if (sc->fw.capa[0] & (1U << IWM_UCODE_TLV_CAPA_DQA_SUPPORT)) {
+		/* Match firmware queue mode; no packet queues are activated. */
+		dqa = LE_32(r->cmdqid);
+		if ((error = iwm_control(sc, IWM_DQA_ENABLE_CMD,
+		    &dqa, sizeof (dqa))) != 0)
+			return (error);
+	}
+	/* CAPA_CT_KILL_BY_FW: delegate thermal protection to firmware. */
+	if (sc->fw.capa[2] & (1U << (IWM_CAPA_CT_KILL_BY_FW % 32))) {
+		bzero(thermal, sizeof (thermal));
+		if ((error = iwm_control(sc, IWM_TEMP_THRESHOLDS_CMD,
+		    thermal, sizeof (thermal))) != 0)
+			return (error);
+	}
+	r->state = IWM_REGULAR_IDLE;
+	return (iwm_checkpoint(sc, "REGULAR-idle"));
 }
 
 /*
@@ -1390,10 +1872,21 @@ iwm_run_free(struct iwm_softc *sc)
 	if (r == NULL)
 		return (0);
 	mutex_enter(&sc->lock);
-	error = iwm_device_stop(sc);
+	error = iwm_device_stop(sc, B_TRUE);
 	mutex_exit(&sc->lock);
 	if (iwm_intr_disable(sc) != 0 || error != 0)
 		return (EIO);
+	for (i = IWM_PAGING_BLOCKS - 1; i >= 0; i--) {
+		if (iwm_dma_free(&r->paging[i]) != 0)
+			return (EIO);
+	}
+	for (i = IWM_PHY_DB_ENTRIES - 1; i >= 0; i--) {
+		if (r->phy_db[i].data != NULL) {
+			kmem_free(r->phy_db[i].data, r->phy_db[i].length);
+			r->phy_db[i].data = NULL;
+			r->phy_db[i].length = 0;
+		}
+	}
 	for (i = IWM_NVM_NUM_OF_SECTIONS - 1; i >= 0; i--) {
 		if (r->nvm[i] != NULL) {
 			kmem_free(r->nvm[i], IWM_NVM_LIMIT);
@@ -1469,19 +1962,24 @@ iwm_run_alloc(struct iwm_softc *sc)
 }
 
 /*
- * Explicit development opt-in performs exactly one INIT/NVM cycle. No retry,
- * REGULAR image, calibration/radio command, MAC or packet submission exists.
+ * Development opt-in performs one INIT/NVM cycle; iwm-full-init additionally
+ * calibrates and restarts REGULAR. No retries, MAC or packet submissions.
  */
 int
 iwm_init_nvm(struct iwm_softc *sc)
 {
 	struct iwm_runtime *r;
 	int error, stop_error, host_error;
+	clock_t idle_end;
 
 	ASSERT(sc->run == NULL);
 	r = kmem_zalloc(sizeof (*r), KM_SLEEP);
 	cv_init(&r->cv, NULL, CV_DRIVER, NULL);
 	sc->run = r;
+	r->image = IWM_FW_INIT;
+	r->generation = 1;
+	r->full_cycle = ddi_prop_get_int(DDI_DEV_T_ANY, sc->dip,
+	    DDI_PROP_DONTPASS, "iwm-full-init", 0) != 0;
 	if ((error = iwm_fw_read(sc)) != 0)
 		return (error);
 	r->state = IWM_FW_LOADED;
@@ -1493,11 +1991,13 @@ iwm_init_nvm(struct iwm_softc *sc)
 	r->cmdqid = (sc->fw.capa[IWM_UCODE_TLV_CAPA_DQA_SUPPORT / 32] &
 	    (1U << (IWM_UCODE_TLV_CAPA_DQA_SUPPORT % 32))) ?
 	    IWM_DQA_CMD_QUEUE : IWM_CMD_QUEUE;
-	dev_err(sc->dip, CE_NOTE, "!iwm firmware %u.%08x.%u INIT only "
+	dev_err(sc->dip, CE_NOTE, "!iwm firmware %u.%08x.%u "
 	    "command-q=%u PHY=%08x timeout=%u us", sc->fw.version[0],
 	    sc->fw.version[1], sc->fw.version[2], r->cmdqid,
 	    sc->fw.phy_config, IWM_WAIT_US);
 	if ((error = iwm_run_alloc(sc)) != 0)
+		return (error);
+	if (r->full_cycle && (error = iwm_paging_alloc(sc)) != 0)
 		return (error);
 	if (sc->intr_cap & DDI_INTR_FLAG_BLOCK)
 		error = ddi_intr_block_enable(&sc->intr, 1);
@@ -1518,15 +2018,39 @@ iwm_init_nvm(struct iwm_softc *sc)
 		error = iwm_post_alive(sc);
 	if (error == 0)
 		error = iwm_nvm(sc);
+	if (error == 0 && r->full_cycle)
+		error = iwm_calibrate(sc);
+	if (error == 0 && r->full_cycle)
+		error = iwm_restart(sc);
+	if (error == 0 && r->full_cycle)
+		error = iwm_upload(sc);
+	if (error == 0 && r->full_cycle)
+		error = iwm_post_alive(sc);
+	if (error == 0 && r->full_cycle) {
+		/* Keep NIC access across the donor's REGULAR configuration. */
+		error = iwm_nic_lock(sc);
+		if (error == 0) {
+			error = iwm_regular_config(sc);
+			iwm_nic_unlock(sc);
+		}
+	}
+	if (error == 0 && r->full_cycle) {
+		idle_end = ddi_get_lbolt() + drv_usectohz(IWM_WAIT_US);
+		while (r->error == 0 && ddi_get_lbolt() < idle_end)
+			(void) cv_timedwait(&r->cv, &sc->lock, idle_end);
+		error = r->error;
+		if (error == 0)
+			error = iwm_queues_check(sc, "REGULAR-idle");
+	}
 	if (error != 0)
 		dev_err(sc->dip, CE_WARN,
-		    "!iwm INIT/NVM failed error=%d state=%u "
+		    "!iwm firmware cycle failed error=%d state=%u "
 		    "INT=%08x FH=%08x RESET=%08x", error, r->state,
 		    iwm_rd(sc, IWM_CSR_INT), iwm_rd(sc, IWM_CSR_FH_INT_STATUS),
 		    iwm_rd(sc, IWM_CSR_RESET));
 	if (r->first_error.reason != IWM_PROTO_OK)
 		iwm_proto_report(sc, &r->first_error);
-	stop_error = iwm_device_stop(sc);
+	stop_error = iwm_device_stop(sc, B_TRUE);
 	dev_err(sc->dip, CE_NOTE,
 	    "!iwm protocol original-error=%d reason=%u shutdown-error=%d",
 	    error, r->first_error.reason, stop_error);
@@ -1539,7 +2063,8 @@ iwm_init_nvm(struct iwm_softc *sc)
 		error = r->error;
 	if (error == 0)
 		dev_err(sc->dip, CE_NOTE,
-		    "!iwm INIT/NVM cycle complete and stopped; "
-		    "no radio or MAC; checkpoints=%d", sc->attach_step);
+		    "!iwm firmware cycle complete and stopped; full=%u "
+		    "no scan or MAC; checkpoints=%d", r->full_cycle,
+		    sc->attach_step);
 	return (error);
 }

@@ -21,7 +21,8 @@
  * not an implementation of OpenBSD kernel interfaces.
  *
  * Passive attach by default. The iwm-init-nvm property opts into one bounded
- * INIT firmware/NVM cycle, stopped before attach returns. No MAC registration
+ * INIT firmware/NVM cycle; iwm-full-init additionally calibrates and restarts
+ * REGULAR. Both stop before attach returns. No MAC registration
  * or network data path exists.
  */
 
