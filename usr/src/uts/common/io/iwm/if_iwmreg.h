@@ -829,6 +829,176 @@ CTASSERT(sizeof (struct iwm_alive_resp_v1) == 44);
 CTASSERT(sizeof (struct iwm_alive_resp_v2) == 64);
 CTASSERT(sizeof (struct iwm_alive_resp_v3) == 68);
 
+/* Selected API36 scan/RX wire layouts from the pinned donor. */
+#define	IWM_SCAN_OFFLOAD_PROBE_REQ_SIZE	512
+#define	IWM_PROBE_OPTION_MAX	20
+#define	IWM_MAX_SCHED_SCAN_PLANS	2
+#define	IWM_RX_INFO_PHY_CNT	8
+struct iwm_scd_txq_cfg_cmd {
+	uint8_t token;
+	uint8_t sta_id;
+	uint8_t tid;
+	uint8_t scd_queue;
+	uint8_t enable;
+	uint8_t aggregate;
+	uint8_t tx_fifo;
+	uint8_t window;
+	uint16_t ssn;
+	uint16_t reserved;
+} __attribute__((__packed__));
+
+struct iwm_add_sta_cmd {
+	uint8_t add_modify;
+	uint8_t awake_acs;
+	uint16_t tid_disable_tx;
+	uint32_t mac_id_n_color;
+	uint8_t addr[6];	/* _STA_ID_MODIFY_INFO_API_S_VER_1 */
+	uint16_t reserved2;
+	uint8_t sta_id;
+	uint8_t modify_mask;
+	uint16_t reserved3;
+	uint32_t station_flags;
+	uint32_t station_flags_msk;
+	uint8_t add_immediate_ba_tid;
+	uint8_t remove_immediate_ba_tid;
+	uint16_t add_immediate_ba_ssn;
+	uint16_t sleep_tx_count;
+	uint8_t sleep_state_flags;
+	uint8_t station_type;
+	uint16_t assoc_id;
+	uint16_t beamform_flags;
+	uint32_t tfd_queue_msk;
+	uint16_t rx_ba_window;
+	uint8_t sp_length;
+	uint8_t uapsd_acs;
+} __attribute__((__packed__));
+
+struct iwm_scan_probe_segment {
+	uint16_t offset;
+	uint16_t len;
+} __attribute__((__packed__));
+
+struct iwm_scan_probe_req_v1 {
+	struct iwm_scan_probe_segment mac_header;
+	struct iwm_scan_probe_segment band_data[2];
+	struct iwm_scan_probe_segment common_data;
+	uint8_t buf[IWM_SCAN_OFFLOAD_PROBE_REQ_SIZE];
+} __attribute__((__packed__));
+
+struct iwm_ssid_ie {
+	uint8_t id;
+	uint8_t len;
+	uint8_t ssid[IEEE80211_NWID_LEN];
+} __attribute__((__packed__));
+
+struct iwm_scan_umac_schedule {
+	uint16_t interval;
+	uint8_t iter_count;
+	uint8_t reserved;
+} __attribute__((__packed__));
+
+struct iwm_scan_req_umac_tail_v1 {
+	/* SCAN_PERIODIC_PARAMS_API_S_VER_1 */
+	struct iwm_scan_umac_schedule schedule[IWM_MAX_SCHED_SCAN_PLANS];
+	uint16_t delay;
+	uint16_t reserved;
+	/* SCAN_PROBE_PARAMS_API_S_VER_1 */
+	struct iwm_scan_probe_req_v1 preq;
+	struct iwm_ssid_ie direct_scan[IWM_PROBE_OPTION_MAX];
+} __attribute__((__packed__));
+
+struct iwm_scan_umac_chan_param {
+	uint8_t flags;
+	uint8_t count;
+	uint16_t reserved;
+} __attribute__((__packed__));
+
+struct iwm_scan_channel_cfg_umac {
+	uint32_t flags;
+	uint8_t channel_num;
+	uint8_t iter_count;
+	uint16_t iter_interval;
+} __attribute__((__packed__));
+
+struct iwm_scan_config {
+	uint32_t flags;
+	uint32_t tx_chains;
+	uint32_t rx_chains;
+	uint32_t legacy_rates;
+	uint32_t out_of_channel_time;
+	uint32_t suspend_time;
+	uint8_t dwell_active;
+	uint8_t dwell_passive;
+	uint8_t dwell_fragmented;
+	uint8_t dwell_extended;
+	uint8_t mac_addr[6];
+	uint8_t bcast_sta_id;
+	uint8_t channel_flags;
+	uint8_t channel_array[];
+} __attribute__((__packed__));
+
+struct iwm_rx_phy_info {
+	uint8_t non_cfg_phy_cnt;
+	uint8_t cfg_phy_cnt;
+	uint8_t stat_id;
+	uint8_t reserved1;
+	uint32_t system_timestamp;
+	uint64_t timestamp;
+	uint32_t beacon_time_stamp;
+	uint16_t phy_flags;
+	uint16_t channel;
+	uint32_t non_cfg_phy[IWM_RX_INFO_PHY_CNT];
+	uint32_t rate_n_flags;
+	uint32_t byte_count;
+	uint16_t mac_active_msk;
+	uint16_t frame_time;
+} __attribute__((__packed__));
+
+struct iwm_rx_mpdu_res_start {
+	uint16_t byte_count;
+	uint16_t reserved;
+} __attribute__((__packed__));
+
+struct iwm_umac_scan_complete {
+	uint32_t uid;
+	uint8_t last_schedule;
+	uint8_t last_iter;
+	uint8_t status;
+	uint8_t ebs_status;
+	uint32_t time_from_last_iter;
+	uint32_t reserved;
+} __attribute__((__packed__));
+
+/* Only the selected v7 prefix; other UMAC request generations omitted. */
+struct iwm_scan_v7 {
+	uint32_t flags;
+	uint32_t uid;
+	uint32_t ooc_priority;
+	uint16_t general_flags;
+	uint8_t reserved;
+	uint8_t scan_start_mac_id;
+	uint8_t active_dwell;
+	uint8_t passive_dwell;
+	uint8_t fragmented_dwell;
+	uint8_t adwell_default_n_aps;
+	uint8_t adwell_default_n_aps_social;
+	uint8_t reserved3;
+	uint16_t adwell_max_budget;
+	uint32_t max_out_time[2];
+	uint32_t suspend_time[2];
+	uint32_t scan_priority;
+	struct iwm_scan_umac_chan_param channel;
+} __attribute__((__packed__));
+
+CTASSERT(sizeof (struct iwm_scan_v7) == 48);
+CTASSERT(sizeof (struct iwm_add_sta_cmd) == 48);
+CTASSERT(sizeof (struct iwm_scd_txq_cfg_cmd) == 12);
+CTASSERT(sizeof (struct iwm_rx_phy_info) == 68);
+CTASSERT(sizeof (struct iwm_rx_mpdu_res_start) == 4);
+CTASSERT(sizeof (struct iwm_umac_scan_complete) == 16);
+CTASSERT(sizeof (struct iwm_scan_config) == 36);
+CTASSERT(sizeof (struct iwm_scan_channel_cfg_umac) == 8);
+
 #ifdef __cplusplus
 }
 #endif

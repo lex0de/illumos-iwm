@@ -113,7 +113,7 @@
  * Copyright 2026 lex0de <lex0de@tuta.com>
  * 8260 firmware transport derived from OpenBSD sys/dev/pci/if_iwm.c,
  * 0efabb066d34187a404f31d303b3b97103df1117, BSD licence option.
- * Native DDI ownership, bounded completion waits and no wireless-stack calls.
+ * Native DDI ownership, bounded waits and private passive net80211 scanning.
  */
 #include <sys/types.h>
 #include <sys/sysmacros.h>
@@ -254,7 +254,67 @@ struct iwm_phy_entry {
 	size_t length;
 };
 
+#define	IWM_SCAN_CHANNELS	52
+#define	IWM_SCAN_RX_LIMIT	64
+#define	IWM_SCAN_UID	0
+#define	IWM_SCAN_PASSIVE	0x200c
+#define	IWM_AUX_QUEUE	1
+#define	IWM_AUX_STA	1
+#define	IWM_SCAN_COMPLETED	1
+#define	IWM_SCAN_ABORTED	2
+
+struct iwm_scan_frame {
+	mblk_t *mp;
+	uint_t channel;
+	int rssi;
+	uint32_t timestamp;
+};
+
+struct iwm_scan_state {
+	boolean_t enabled;
+	boolean_t attached;
+	boolean_t running;
+	boolean_t submitted;
+	boolean_t outstanding;
+	boolean_t accepting;
+	boolean_t delivering;
+	boolean_t abort_requested;
+	boolean_t terminal_consumed;
+	uint32_t uid;
+	uint32_t terminal_uid;
+	uint_t abort_commands;
+	int error;
+	int abort_error;
+	boolean_t complete;
+	boolean_t cancelled;
+	boolean_t aux_queue;
+	boolean_t aux_station;
+	boolean_t configured;
+	boolean_t phy_valid;
+	uint_t channels;
+	uint8_t channel[14];
+	struct iwm_rx_phy_info phy;
+	struct iwm_scan_frame frames[IWM_SCAN_RX_LIMIT];
+	uint_t head;
+	uint_t tail;
+	uint_t queued;
+	uint_t accepted;
+	uint_t malformed;
+	uint_t channel_mismatch;
+	uint_t dropped;
+	uint_t beacons;
+	uint_t probes;
+	uint_t overflow;
+	uint_t xmit_calls;
+	uint_t state_violations;
+	uint_t nodes;
+	uint_t completion_status;
+	uint_t completion_iteration;
+	int (*newstate)(ieee80211com_t *, enum ieee80211_state, int);
+};
+
 struct iwm_runtime {
+	struct iwm_scan_state scan;
 	struct iwm_proto_diag diagnostic;
 	struct iwm_proto_diag first_error;
 	struct iwm_proto_diag response_diagnostic;
@@ -612,7 +672,8 @@ iwm_queues_check(struct iwm_softc *sc, const char *boundary)
 		if (q == r->cmdqid)
 			continue;
 		if (rd != 0 || wr != 0 ||
-		    (status & (1 << IWM_SCD_QUEUE_STTS_REG_POS_ACTIVE))) {
+		    ((status & (1 << IWM_SCD_QUEUE_STTS_REG_POS_ACTIVE)) &&
+		    !(r->scan.aux_queue && q == IWM_AUX_QUEUE))) {
 			error = EIO;
 			dev_err(sc->dip, CE_WARN, "!iwm %s unused q%u "
 			    "rd=%08x wr=%08x status=%08x", boundary, q, rd,
@@ -997,6 +1058,350 @@ iwm_calibration_complete(const struct iwm_runtime *r)
 	return (papd && txp);
 }
 
+/* Build only the authenticated firmware's UMAC v7 / v1-tail request. */
+static int
+iwm_scan_request(const struct iwm_scan_state *s, const uint8_t *mac,
+    uint8_t *data, size_t size)
+{
+	struct iwm_scan_v7 *req = (void *)data;
+	struct iwm_scan_channel_cfg_umac *ch;
+	struct iwm_scan_req_umac_tail_v1 *tail;
+	uint8_t *probe;
+	uint_t i;
+	static const uint8_t rates[] =
+	    { 1, 8, 2, 4, 11, 22, 12, 18, 24, 36, 50, 4, 48, 72, 96, 108 };
+
+	if (size != sizeof (*req) + IWM_SCAN_CHANNELS * sizeof (*ch) +
+	    sizeof (*tail) || s->channels == 0 || s->channels > 14)
+		return (EINVAL);
+	for (i = 0; i < s->channels; i++) {
+		if (s->channel[i] == 0 || s->channel[i] > 14 ||
+		    (i != 0 && s->channel[i] <= s->channel[i - 1]))
+			return (EINVAL);
+	}
+	bzero(data, size);
+	req->uid = LE_32(IWM_SCAN_UID);
+	req->ooc_priority = LE_32(2);
+	req->general_flags = LE_16(IWM_SCAN_PASSIVE);
+	req->active_dwell = 10;
+	req->passive_dwell = 110;
+	req->fragmented_dwell = 44;
+	req->adwell_default_n_aps = 2;
+	req->adwell_default_n_aps_social = 10;
+	req->adwell_max_budget = LE_16(300);
+	req->scan_priority = LE_32(2);
+	req->channel.count = s->channels;
+	ch = (void *)(data + sizeof (*req));
+	for (i = 0; i < s->channels; i++) {
+		ch[i].channel_num = s->channel[i];
+		ch[i].iter_count = 1;
+	}
+	tail = (void *)(ch + IWM_SCAN_CHANNELS);
+	tail->schedule[0].iter_count = 1;
+	/* ABI template only: no SSID selection or active-probe permission. */
+	probe = tail->preq.buf;
+	probe[0] = IEEE80211_FC0_SUBTYPE_PROBE_REQ;
+	memset(probe + 4, 0xff, 6);
+	bcopy(mac, probe + 10, 6);
+	memset(probe + 16, 0xff, 6);
+	tail->preq.mac_header.len = LE_16(26);
+	tail->preq.band_data[0].offset = LE_16(26);
+	tail->preq.band_data[0].len = LE_16(sizeof (rates));
+	bcopy(rates, probe + 26, sizeof (rates));
+	return (0);
+}
+
+/* Complete TLVs and native parser field minima, before ieee80211_input. */
+static int
+iwm_scan_frame_check(const uint8_t *p, size_t n, uint_t channel)
+{
+	size_t off = 36, len;
+	uint_t id;
+	boolean_t ssid = B_FALSE, rates = B_FALSE;
+
+	if (n < 24)
+		return (EPROTO);
+	if ((p[0] & 0x0f) != 0 || (p[0] != 0x80 && p[0] != 0x50))
+		return (ENOTSUP);
+	if (n < off || (p[1] & 0xc7) != 0 || (iwm_u16(p + 22) & 15) != 0 ||
+	    (p[10] & 1) != 0 || (p[16] & 1) != 0)
+		return (EPROTO);
+	while (off < n) {
+		if (n - off < 2)
+			return (EPROTO);
+		id = p[off];
+		len = p[off + 1];
+		if (len > n - off - 2)
+			return (EPROTO);
+		if (id == 0) {
+			if (ssid || len > 32)
+				return (EPROTO);
+			ssid = B_TRUE;
+		} else if (id == 1) {
+			if (rates || len == 0 || len > 8)
+				return (EPROTO);
+			rates = B_TRUE;
+		} else if (id == 3) {
+			if (len != 1)
+				return (EPROTO);
+			if (p[off + 2] != channel)
+				return (EXDEV);
+		} else if ((id == 5 && len < 4) ||
+		    (id == 221 && len < 4)) {
+			return (EPROTO);
+		}
+		off += len + 2;
+	}
+	return (ssid && rates ? 0 : EPROTO);
+}
+
+static struct iwm_softc *
+iwm_scan_softc(ieee80211com_t *ic)
+{
+	return ((struct iwm_softc *)((char *)ic -
+	    offsetof(struct iwm_softc, ic)));
+}
+
+static int
+iwm_scan_xmit(ieee80211com_t *ic, mblk_t *mp, uint8_t type)
+{
+	struct iwm_softc *sc = iwm_scan_softc(ic);
+
+	_NOTE(ARGUNUSED(type))
+	freemsg(mp);
+	mutex_enter(&sc->lock);
+	sc->run->scan.xmit_calls++;
+	sc->run->error = EACCES;
+	cv_broadcast(&sc->run->cv);
+	mutex_exit(&sc->lock);
+	return (ENOTSUP);
+}
+
+static int
+iwm_scan_newstate(ieee80211com_t *ic, enum ieee80211_state state, int arg)
+{
+	struct iwm_softc *sc = iwm_scan_softc(ic);
+	struct iwm_scan_state *s = &sc->run->scan;
+
+	_NOTE(ARGUNUSED(arg))
+	if (state != IEEE80211_S_INIT &&
+	    !(state == IEEE80211_S_SCAN && ic->ic_state == IEEE80211_S_INIT &&
+	    s->running && !s->cancelled)) {
+		mutex_enter(&sc->lock);
+		s->state_violations++;
+		sc->run->error = EACCES;
+		cv_broadcast(&sc->run->cv);
+		mutex_exit(&sc->lock);
+		return (ENOTSUP);
+	}
+	mutex_enter(&ic->ic_genlock);
+	ic->ic_state = state;
+	mutex_exit(&ic->ic_genlock);
+	return (0);
+}
+
+/* Called in thread context without sc->lock; NVM is already validated. */
+static int
+iwm_scan_attach(struct iwm_softc *sc)
+{
+	struct iwm_runtime *r = sc->run;
+	struct iwm_scan_state *s = &r->scan;
+	ieee80211com_t *ic = &sc->ic;
+	uint_t i;
+	static const struct ieee80211_rateset rates_b =
+	    { 4, { 2, 4, 11, 22 } };
+	static const struct ieee80211_rateset rates_g =
+	    { 12, { 2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108 } };
+
+	if (s->attached || !r->tx_ant || !r->rx_ant || !(r->sku & 1) ||
+	    sc->fw.scan_channels != IWM_SCAN_CHANNELS ||
+	    !(sc->fw.capa[0] & (1U << 2)) || !(sc->fw.api[1] & 1) ||
+	    (sc->fw.api[1] & ((1U << 10) | (1U << 26))))
+		return (ENOTSUP);
+	bzero(ic, sizeof (*ic));
+	ic->ic_phytype = IEEE80211_T_OFDM;
+	ic->ic_opmode = IEEE80211_M_STA;
+	ic->ic_state = IEEE80211_S_INIT;
+	ic->ic_curmode = IEEE80211_MODE_11G;
+	ic->ic_maxrssi = 100;
+	ic->ic_xmit = iwm_scan_xmit;
+	bcopy(r->mac, ic->ic_macaddr, sizeof (ic->ic_macaddr));
+	ic->ic_sup_rates[IEEE80211_MODE_11B] = rates_b;
+	ic->ic_sup_rates[IEEE80211_MODE_11G] = rates_g;
+	for (i = 0; i < 14; i++) {
+		if (!(r->channels[i] & 1))
+			continue;
+		s->channel[s->channels++] = i + 1;
+		ic->ic_sup_channels[i + 1].ich_freq =
+		    ieee80211_ieee2mhz(i + 1, IEEE80211_CHAN_2GHZ);
+		ic->ic_sup_channels[i + 1].ich_flags = IEEE80211_CHAN_CCK |
+		    IEEE80211_CHAN_OFDM | IEEE80211_CHAN_DYN |
+		    IEEE80211_CHAN_2GHZ | IEEE80211_CHAN_PASSIVE;
+	}
+	if (s->channels == 0)
+		return (ENOENT);
+	ieee80211_attach(ic);
+	s->attached = B_TRUE;
+	s->newstate = ic->ic_newstate;
+	ic->ic_newstate = iwm_scan_newstate;
+	ieee80211_media_init(ic);
+	return (iwm_checkpoint(sc, "net80211-attached"));
+}
+
+/* Driver lock held; the sole delivery thread also owns scan teardown. */
+static void
+iwm_scan_drain(struct iwm_softc *sc)
+{
+	struct iwm_scan_state *s = &sc->run->scan;
+	uint_t i;
+
+	s->accepting = B_FALSE;
+	ASSERT(!s->delivering);
+	for (i = 0; i < IWM_SCAN_RX_LIMIT; i++) {
+		if (s->frames[i].mp != NULL) {
+			freemsg(s->frames[i].mp);
+			s->frames[i].mp = NULL;
+		}
+	}
+	s->queued = 0;
+	s->head = s->tail = 0;
+}
+
+/* Same thread as native input; no callback can survive this boundary. */
+static int
+iwm_scan_detach(struct iwm_softc *sc)
+{
+	struct iwm_scan_state *s = &sc->run->scan;
+
+	if (!s->attached)
+		return (0);
+	mutex_enter(&sc->lock);
+	ASSERT(!s->outstanding || sc->run->stopped);
+	iwm_scan_drain(sc);
+	mutex_exit(&sc->lock);
+	ieee80211_cancel_scan(&sc->ic);
+	sc->ic.ic_flags &= ~IEEE80211_F_SCANONLY;
+	(void) iwm_scan_newstate(&sc->ic, IEEE80211_S_INIT, 0);
+	ieee80211_detach(&sc->ic);
+	s->attached = B_FALSE;
+	return (iwm_checkpoint(sc, "net80211-detached"));
+}
+
+/* MSI context, validated enclosing packet, driver lock held. */
+static void
+iwm_scan_rx(struct iwm_softc *sc, uint_t code, const uint8_t *p, size_t n)
+{
+	struct iwm_scan_state *s = &sc->run->scan;
+	struct iwm_scan_frame *f;
+	uint_t channel, i, energy;
+	uint32_t status, signals;
+	size_t size;
+	int error, dbm = -256, rssi;
+	boolean_t allowed = B_FALSE;
+
+	if (sc->run->image != IWM_FW_REGULAR ||
+	    !s->accepting || !s->running || !s->submitted ||
+	    s->complete || s->cancelled) {
+		s->dropped++;
+		return;
+	}
+	if (code == 0xc0) {
+		s->phy_valid = B_FALSE;
+		if (n < sizeof (s->phy) || p[0] < 8 ||
+		    p[0] > sizeof (s->phy.non_cfg_phy) || p[1] > 20) {
+			s->malformed++;
+			return;
+		}
+		bcopy(p, &s->phy, sizeof (s->phy));
+		s->phy_valid = B_TRUE;
+		return;
+	}
+	if (!s->phy_valid || n < 8) {
+		s->malformed++;
+		return;
+	}
+	size = iwm_u16(p);
+	if (size > n - 8) {
+		s->malformed++;
+		return;
+	}
+	status = iwm_u32(p + 4 + size);
+	channel = LE_16(s->phy.channel);
+	for (i = 0; i < s->channels; i++)
+		allowed |= s->channel[i] == channel;
+	if ((status & 3) != 3 || !allowed ||
+	    !(LE_16(s->phy.phy_flags) & 1)) {
+		s->malformed++;
+		return;
+	}
+	error = iwm_scan_frame_check(p + 4, size, channel);
+	if (error != 0) {
+		if (error == EXDEV)
+			s->channel_mismatch++;
+		else if (error == ENOTSUP)
+			s->dropped++;
+		else
+			s->malformed++;
+		return;
+	}
+	if (s->queued == IWM_SCAN_RX_LIMIT ||
+	    s->accepted + s->queued >= 256) {
+		s->overflow++;
+		return;
+	}
+	f = &s->frames[s->tail];
+	f->mp = allocb(size, BPRI_MED);
+	if (f->mp == NULL) {
+		s->overflow++;
+		return;
+	}
+	signals = LE_32(s->phy.non_cfg_phy[1]);
+	for (i = 0; i < 3; i++) {
+		energy = (signals >> (8 * i)) & 255;
+		if (energy && -(int)energy > dbm)
+			dbm = -(int)energy;
+	}
+	rssi = (100 * 75 * 75 - (-20 - dbm) *
+	    (15 * 75 + 62 * (-20 - dbm))) / (75 * 75);
+	f->rssi = MAX(1, MIN(100, rssi));
+	f->channel = channel;
+	f->timestamp = LE_32(s->phy.system_timestamp);
+	bcopy(p + 4, f->mp->b_wptr, size);
+	f->mp->b_wptr += size;
+	s->tail = (s->tail + 1) % IWM_SCAN_RX_LIMIT;
+	s->queued++;
+	/* Retain the queued copy on failure for thread-context teardown. */
+	if (s->accepted == 0 && s->queued == 1 &&
+	    (error = iwm_checkpoint(sc, "scan-frame-queued")) != 0) {
+		s->error = error;
+		s->accepting = B_FALSE;
+	}
+	cv_broadcast(&sc->run->cv);
+}
+
+static void
+iwm_scan_completion(struct iwm_softc *sc, const uint8_t *p, size_t n)
+{
+	struct iwm_scan_state *s = &sc->run->scan;
+
+	if (sc->run->image != IWM_FW_REGULAR ||
+	    sc->run->state != IWM_REGULAR_IDLE ||
+	    !s->running || !s->submitted || s->complete || s->cancelled ||
+	    n != 16 ||
+	    iwm_u32(p) != s->uid || p[4] != 0 || p[5] > 1) {
+		sc->run->error = EPROTO;
+		return;
+	}
+	s->terminal_uid = iwm_u32(p);
+	s->completion_status = p[6];
+	s->completion_iteration = p[5];
+	s->complete = B_TRUE;
+	s->outstanding = B_FALSE;
+	s->accepting = B_FALSE;
+	/* Result policy belongs to the waiter, not the command transport. */
+	cv_broadcast(&sc->run->cv);
+}
+
 static void
 iwm_notification(struct iwm_softc *sc, const uint8_t *p, size_t length)
 {
@@ -1017,6 +1422,14 @@ iwm_notification(struct iwm_softc *sc, const uint8_t *p, size_t length)
 	d->pending = r->command_pending;
 	d->payload = n;
 
+	if (r->scan.enabled && (code == 0xc0 || code == 0xc1)) {
+		iwm_scan_rx(sc, code, data, n);
+		return;
+	}
+	if (r->scan.enabled && code == 0x0f) {
+		iwm_scan_completion(sc, data, n);
+		return;
+	}
 	if (code == IWM_ALIVE) {
 		if (r->alive || (r->state != IWM_INIT_UPLOAD &&
 		    r->state != IWM_REGULAR_UPLOAD) ||
@@ -1292,6 +1705,260 @@ iwm_control(struct iwm_softc *sc, uint_t code, const void *data, size_t size)
 		r->control_command = B_FALSE;
 	}
 	return (error);
+}
+
+/* This path has no PHY_CONTEXT, MAC, binding or normal-station command. */
+static int
+iwm_scan_configure(struct iwm_softc *sc)
+{
+	struct iwm_scan_state *s = &sc->run->scan;
+	struct iwm_scd_txq_cfg_cmd queue;
+	struct iwm_add_sta_cmd station;
+	uint8_t config[sizeof (struct iwm_scan_config) + IWM_SCAN_CHANNELS];
+	struct iwm_scan_config *cfg = (void *)config;
+	uint32_t flags;
+	int error;
+
+	if (sc->run->image != IWM_FW_REGULAR ||
+	    sc->run->state != IWM_REGULAR_IDLE || !s->attached ||
+	    !(sc->fw.capa[0] & (1U << 12)) ||
+	    !(sc->fw.api[0] & (1U << 30)))
+		return (ENOTSUP);
+	bzero(&queue, sizeof (queue));
+	queue.sta_id = IWM_AUX_STA;
+	queue.tid = 8;
+	queue.scd_queue = IWM_AUX_QUEUE;
+	queue.enable = 1;
+	queue.tx_fifo = 5;
+	queue.window = 64;
+	if ((error = iwm_checkpoint(sc, "before-aux-queue")) != 0)
+		return (error);
+	if ((error = iwm_nic_lock(sc)) != 0)
+		return (error);
+	/* Donor queue setup publishes zero, never a host frame. */
+	iwm_wr(sc, IWM_HBUS_TARG_WRPTR, IWM_AUX_QUEUE << 8);
+	error = iwm_control(sc, 0x1d, &queue, sizeof (queue));
+	iwm_nic_unlock(sc);
+	if (error != 0)
+		return (error);
+	s->aux_queue = B_TRUE;
+	if ((error = iwm_checkpoint(sc, "aux-queue")) != 0)
+		return (error);
+	bzero(&station, sizeof (station));
+	station.sta_id = IWM_AUX_STA;
+	station.station_type = 4;
+	station.mac_id_n_color = LE_32(4);
+	station.tfd_queue_msk = LE_32(1U << IWM_AUX_QUEUE);
+	station.tid_disable_tx = LE_16(0xffff);
+	if ((error = iwm_control(sc, 0x18, &station, sizeof (station))) != 0)
+		return (error);
+	if (sc->run->response_len != 4 ||
+	    (iwm_u32(sc->run->response) & 0xff) != 1)
+		return (EIO);
+	s->aux_station = B_TRUE;
+	if ((error = iwm_checkpoint(sc, "aux-station")) != 0)
+		return (error);
+	bzero(config, sizeof (config));
+	/* ACTIVATE, forbid CHUB, set masks/station/times/rates/MAC/channels. */
+	flags = 1U | (1U << 2) | (15U << 8) | (7U << 13) |
+	    (1U << 17) | (s->channels << 26);
+	cfg->flags = LE_32(flags);
+	cfg->tx_chains = LE_32(sc->run->tx_ant);
+	cfg->rx_chains = LE_32(sc->run->rx_ant);
+	cfg->legacy_rates = LE_32(0x0fff0fff);
+	cfg->dwell_active = 10;
+	cfg->dwell_passive = 110;
+	cfg->dwell_fragmented = 44;
+	cfg->dwell_extended = 90;
+	bcopy(sc->run->mac, cfg->mac_addr, 6);
+	cfg->bcast_sta_id = IWM_AUX_STA;
+	bcopy(s->channel, cfg->channel_array, s->channels);
+	if ((error = iwm_checkpoint(sc, "scan-config-zero-contexts")) != 0)
+		return (error);
+	if ((error = iwm_control(sc, 0x10c, config, sizeof (config))) != 0)
+		return (error);
+	s->configured = B_TRUE;
+	return (iwm_checkpoint(sc, "scan-configured"));
+}
+
+/* Called with sc->lock; drops it only while native stack owns the copy. */
+static int
+iwm_scan_deliver(struct iwm_softc *sc)
+{
+	struct iwm_scan_state *s = &sc->run->scan;
+	struct iwm_scan_frame f;
+	ieee80211_node_t *node;
+	uint_t subtype;
+	int error = 0;
+
+	while (s->queued != 0 && s->error == 0 && sc->run->error == 0) {
+		f = s->frames[s->head];
+		s->frames[s->head].mp = NULL;
+		s->head = (s->head + 1) % IWM_SCAN_RX_LIMIT;
+		s->queued--;
+		subtype = f.mp->b_rptr[0];
+		s->delivering = B_TRUE;
+		mutex_exit(&sc->lock);
+		sc->ic.ic_curchan = &sc->ic.ic_sup_channels[f.channel];
+		node = ieee80211_find_rxnode(&sc->ic,
+		    (struct ieee80211_frame *)f.mp->b_rptr);
+		if (node != NULL) {
+			ieee80211_input(&sc->ic, f.mp, node, f.rssi,
+			    f.timestamp);
+			ieee80211_free_node(node);
+		} else {
+			freemsg(f.mp);
+		}
+		mutex_enter(&sc->lock);
+		s->delivering = B_FALSE;
+		if (node == NULL)
+			continue;
+		s->accepted++;
+		if (subtype == 0x80)
+			s->beacons++;
+		else
+			s->probes++;
+		if (s->accepted == 1)
+			error = iwm_checkpoint(sc, "scan-first-frame");
+		if (error != 0)
+			return (error);
+	}
+	return (s->error != 0 ? s->error : sc->run->error);
+}
+
+static void
+iwm_scan_node(void *arg, ieee80211_node_t *node)
+{
+	struct iwm_softc *sc = arg;
+
+	if (node != sc->ic.ic_bss)
+		sc->run->scan.nodes++;
+	/* Read-only FBT/MDB observes the native node here before detach. */
+}
+
+/* Full passive-scan bound also bounds abort termination, without retries. */
+static clock_t
+iwm_scan_ticks(const struct iwm_scan_state *s)
+{
+	return (drv_usectohz(2000000 + s->channels * (110000 + 300 * 1024)));
+}
+
+/* Driver lock held. Command response and final scan event are independent. */
+static int
+iwm_scan_terminate(struct iwm_softc *sc)
+{
+	struct iwm_scan_state *s = &sc->run->scan;
+	uint32_t abort[2] = { LE_32(s->uid), 0 };
+	clock_t end;
+	int error = 0;
+
+	s->accepting = B_FALSE;
+	/* Recheck under the lock: a recorded terminal needs no abort. */
+	if (s->outstanding && !s->complete) {
+		if (s->abort_requested || sc->run->error != 0 ||
+		    sc->run->control_command)
+			return (EIO);
+		s->abort_requested = B_TRUE;
+		s->abort_commands++;
+		error = iwm_control(sc, 0x10e, abort, sizeof (abort));
+		if (error != 0)
+			return (error);
+		end = ddi_get_lbolt() + iwm_scan_ticks(s);
+		while (!s->complete && sc->run->error == 0) {
+			if (cv_timedwait(&sc->run->cv, &sc->lock, end) == -1)
+				break;
+		}
+		if (sc->run->error != 0)
+			return (sc->run->error);
+		if (!s->complete)
+			return (ETIMEDOUT);
+	}
+	if (s->complete) {
+		s->terminal_consumed = B_TRUE;
+		if (s->completion_status != IWM_SCAN_COMPLETED &&
+		    s->completion_status != IWM_SCAN_ABORTED)
+			error = EIO;
+	}
+	return (error);
+}
+
+/* One scan only. The caller owns the eventual hardware stop on every result. */
+static int
+iwm_passive_scan(struct iwm_softc *sc)
+{
+	struct iwm_scan_state *s = &sc->run->scan;
+	uint8_t request[sizeof (struct iwm_scan_v7) +
+	    IWM_SCAN_CHANNELS * sizeof (struct iwm_scan_channel_cfg_umac) +
+	    sizeof (struct iwm_scan_req_umac_tail_v1)];
+	clock_t end;
+	int error;
+
+	if (s->running || s->cancelled || s->complete)
+		return (EBUSY);
+	if ((error = iwm_scan_configure(sc)) != 0)
+		return (error);
+	if ((error = iwm_scan_request(s, sc->run->mac, request,
+	    sizeof (request))) != 0)
+		return (error);
+	s->running = B_TRUE;
+	mutex_exit(&sc->lock);
+	ieee80211_node_table_reset(&sc->ic.ic_scan);
+	sc->ic.ic_flags &= ~IEEE80211_F_ASCAN;
+	sc->ic.ic_flags |= IEEE80211_F_SCAN | IEEE80211_F_SCANONLY;
+	error = iwm_scan_newstate(&sc->ic, IEEE80211_S_SCAN, 0);
+	mutex_enter(&sc->lock);
+	if (error == 0)
+		error = iwm_checkpoint(sc, "scan-submit-zero-contexts");
+	if (error == 0) {
+		s->uid = IWM_SCAN_UID;
+		s->submitted = B_TRUE;
+		s->outstanding = B_TRUE;
+		s->accepting = B_TRUE;
+		error = iwm_control(sc, 0x10d, request, sizeof (request));
+		if (error == 0 && !s->complete)
+			error = iwm_checkpoint(sc, "scan-running");
+	}
+	/* 110ms dwell + 300 TU adaptive budget per channel, plus 2s. */
+	end = ddi_get_lbolt() + iwm_scan_ticks(s);
+	while (error == 0 && sc->run->error == 0 && s->error == 0) {
+		error = iwm_scan_deliver(sc);
+		if (error != 0 || s->complete)
+			break;
+		if (cv_timedwait(&sc->run->cv, &sc->lock, end) == -1) {
+			error = ETIMEDOUT;
+			break;
+		}
+	}
+	if (s->error != 0)
+		error = s->error;
+	else if (error == 0)
+		error = sc->run->error;
+	if (error == 0 && s->completion_status != IWM_SCAN_COMPLETED)
+		error = EIO;
+	if (error == 0)
+		error = iwm_checkpoint(sc, "scan-complete");
+	s->abort_error = iwm_scan_terminate(sc);
+	/* A timeout retains ownership until hardware stop/reset. */
+	if (!s->outstanding)
+		s->running = B_FALSE;
+	iwm_scan_drain(sc);
+	s->cancelled = B_TRUE;
+	mutex_exit(&sc->lock);
+	ieee80211_cancel_scan(&sc->ic);
+	sc->ic.ic_flags &= ~IEEE80211_F_SCANONLY;
+	(void) iwm_scan_newstate(&sc->ic, IEEE80211_S_INIT, 0);
+	ieee80211_iterate_nodes(&sc->ic.ic_scan, iwm_scan_node, sc);
+	mutex_enter(&sc->lock);
+	dev_err(sc->dip, CE_NOTE, "!iwm passive scan error=%d abort=%d "
+	    "complete=%u status=%u frames=%u beacon=%u probe=%u nodes=%u "
+	    "malformed=%u dropped=%u overflow=%u xmit=%u state-errors=%u",
+	    error, s->abort_error, s->complete, s->completion_status,
+	    s->accepted,
+	    s->beacons, s->probes, s->nodes, s->malformed, s->dropped,
+	    s->overflow, s->xmit_calls, s->state_violations);
+	if (error == 0)
+		error = iwm_checkpoint(sc, "scan-cancelled");
+	return (error != 0 ? error : s->abort_error);
 }
 
 static int
@@ -1663,6 +2330,9 @@ iwm_device_stop(struct iwm_softc *sc, boolean_t final)
 		r->stop_failed = B_TRUE;
 		return (error);
 	}
+	r->scan.accepting = B_FALSE;
+	r->scan.outstanding = B_FALSE;
+	r->scan.running = B_FALSE;
 	r->stopped = B_TRUE;
 	r->state = final ? IWM_DEVICE_STOPPED : IWM_IMAGE_STOPPED;
 	return (0);
@@ -1867,7 +2537,7 @@ int
 iwm_run_free(struct iwm_softc *sc)
 {
 	struct iwm_runtime *r = sc->run;
-	int i, error;
+	int i, error, scan_error;
 
 	if (r == NULL)
 		return (0);
@@ -1876,6 +2546,7 @@ iwm_run_free(struct iwm_softc *sc)
 	mutex_exit(&sc->lock);
 	if (iwm_intr_disable(sc) != 0 || error != 0)
 		return (EIO);
+	scan_error = iwm_scan_detach(sc);
 	for (i = IWM_PAGING_BLOCKS - 1; i >= 0; i--) {
 		if (iwm_dma_free(&r->paging[i]) != 0)
 			return (EIO);
@@ -1909,7 +2580,7 @@ iwm_run_free(struct iwm_softc *sc)
 	cv_destroy(&r->cv);
 	kmem_free(r, sizeof (*r));
 	sc->run = NULL;
-	return (0);
+	return (scan_error);
 }
 
 static int
@@ -1980,6 +2651,10 @@ iwm_init_nvm(struct iwm_softc *sc)
 	r->generation = 1;
 	r->full_cycle = ddi_prop_get_int(DDI_DEV_T_ANY, sc->dip,
 	    DDI_PROP_DONTPASS, "iwm-full-init", 0) != 0;
+	r->scan.enabled = ddi_prop_get_int(DDI_DEV_T_ANY, sc->dip,
+	    DDI_PROP_DONTPASS, "iwm-passive-scan", 0) != 0;
+	if (r->scan.enabled && !r->full_cycle)
+		return (EINVAL);
 	if ((error = iwm_fw_read(sc)) != 0)
 		return (error);
 	r->state = IWM_FW_LOADED;
@@ -2018,6 +2693,11 @@ iwm_init_nvm(struct iwm_softc *sc)
 		error = iwm_post_alive(sc);
 	if (error == 0)
 		error = iwm_nvm(sc);
+	if (error == 0 && r->scan.enabled) {
+		mutex_exit(&sc->lock);
+		error = iwm_scan_attach(sc);
+		mutex_enter(&sc->lock);
+	}
 	if (error == 0 && r->full_cycle)
 		error = iwm_calibrate(sc);
 	if (error == 0 && r->full_cycle)
@@ -2042,6 +2722,20 @@ iwm_init_nvm(struct iwm_softc *sc)
 		if (error == 0)
 			error = iwm_queues_check(sc, "REGULAR-idle");
 	}
+	if (error == 0 && r->scan.enabled) {
+		error = iwm_nic_lock(sc);
+		if (error == 0) {
+			error = iwm_passive_scan(sc);
+			iwm_nic_unlock(sc);
+		}
+	}
+	if (r->scan.attached && !r->scan.outstanding) {
+		mutex_exit(&sc->lock);
+		host_error = iwm_scan_detach(sc);
+		if (error == 0)
+			error = host_error;
+		mutex_enter(&sc->lock);
+	}
 	if (error != 0)
 		dev_err(sc->dip, CE_WARN,
 		    "!iwm firmware cycle failed error=%d state=%u "
@@ -2058,13 +2752,17 @@ iwm_init_nvm(struct iwm_softc *sc)
 	host_error = iwm_intr_disable(sc);
 	if (stop_error != 0 || host_error != 0)
 		return (EIO);
+	host_error = iwm_scan_detach(sc);
+	if (error == 0)
+		error = host_error;
 	/* Include errors from the final callback, now drained by DDI. */
 	if (error == 0)
 		error = r->error;
 	if (error == 0)
 		dev_err(sc->dip, CE_NOTE,
 		    "!iwm firmware cycle complete and stopped; full=%u "
-		    "no scan or MAC; checkpoints=%d", r->full_cycle,
+		    "private-scan=%u no MAC; checkpoints=%d", r->full_cycle,
+		    r->scan.enabled,
 		    sc->attach_step);
 	return (error);
 }

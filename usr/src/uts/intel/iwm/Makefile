@@ -26,9 +26,8 @@ include $(UTSBASE)/intel/Makefile.intel
 ALL_TARGET	= $(BINARY)
 INSTALL_TARGET	= $(BINARY) $(ROOTMODULE) $(ROOTFIRMWARE)
 
-# Only mac_init_ops/mac_fini_ops are called.  firmload is part of genunix.
-# Add net80211 when the driver actually registers with the wireless stack.
-LDFLAGS		+= -Nmisc/mac
+# Private scan-table attachment; no public MAC registration.
+LDFLAGS		+= -Nmisc/mac -Nmisc/net80211
 
 .KEEP_STATE:
 

@@ -290,9 +290,10 @@ iwm_fw_parse(struct iwm_fw_info *fw)
 			else
 				fw->capa[index] |= iwm_fw_u32(p + 4);
 			break;
-		case 31: /* N_SCAN_CHANNELS: metadata validation only. */
+		case 31: /* N_SCAN_CHANNELS */
 			if (len != 4 || iwm_fw_u32(p) > 52)
 				return (EINVAL);
+			fw->scan_channels = iwm_fw_u32(p);
 			break;
 		case 32: /* PAGING, retained but not activated for INIT. */
 			if (len != 4 || iwm_fw_u32(p) > 1024 * 1024 ||

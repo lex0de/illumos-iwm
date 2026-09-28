@@ -155,6 +155,7 @@ struct iwm_fw_info {
 	uint32_t	paging_size;
 	uint32_t	cpu_count;
 	uint32_t	cmd_version_count;
+	uint32_t	scan_channels;
 	uint8_t		cmd_versions[1024];
 	struct iwm_fw_image image[IWM_FW_IMAGES];
 };
