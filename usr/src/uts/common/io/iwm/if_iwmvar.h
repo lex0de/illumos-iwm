@@ -123,6 +123,7 @@
 #include <sys/ddi.h>
 #include <sys/sunddi.h>
 #include <sys/net80211.h>
+#include <sys/mac_wifi.h>
 #include <io/iwm/if_iwmreg.h>
 #include <io/iwm/if_iwmfw.h>
 
@@ -193,10 +194,48 @@ struct iwm_cfg {
 #define	IWM_SILICON_C_STEP	2
 #define	IWM_PASSIVE_DMA_COUNT	4
 
+/* Immutable after the bounded attach-time NVM bootstrap. */
+struct iwm_identity {
+	boolean_t valid;
+	uint8_t mac[6];
+	uint16_t nvm_version;
+	uint32_t radio_cfg;
+	uint32_t sku;
+	uint8_t tx_ant;
+	uint8_t rx_ant;
+	uint16_t channels[51];
+	uint16_t lar;
+};
+
+enum iwm_operation {
+	IWM_OP_NONE, IWM_OP_START, IWM_OP_SCAN, IWM_OP_STOP,
+	IWM_OP_DETACH, IWM_OP_READ
+};
+
 struct iwm_softc {
 	dev_info_t		*dip;
 	const struct iwm_cfg	*cfg;
 	ieee80211com_t		ic;
+	struct iwm_identity	identity;
+	wifi_data_t		wifi;
+	kmutex_t		operation_lock;
+	kcondvar_t		operation_cv;
+	enum iwm_operation	operation;
+	boolean_t		operation_initialized;
+	boolean_t		public_enabled;
+	boolean_t		net_attached;
+	boolean_t		mac_registered;
+	boolean_t		minor_created;
+	boolean_t		runtime_started;
+	boolean_t		stop_requested;
+	boolean_t		detach_requested;
+	uint_t			generation;
+	uint_t			scan_generation;
+	uint32_t		xmit_rejected;
+	uint32_t		state_rejected;
+	uint32_t		tx_rejected;
+	uint32_t		multicast_calls;
+	int			runtime_stop_error;
 	ddi_acc_handle_t		pcih;
 	ddi_acc_handle_t		regh;
 	caddr_t			regs;
@@ -245,6 +284,14 @@ int iwm_fw_read(struct iwm_softc *);
 int iwm_checkpoint(struct iwm_softc *, const char *);
 int iwm_intr_disable(struct iwm_softc *);
 int iwm_init_nvm(struct iwm_softc *);
+int iwm_base_dma_alloc(struct iwm_softc *);
+int iwm_preinit(struct iwm_softc *);
+int iwm_runtime_start(struct iwm_softc *);
+int iwm_runtime_stop(struct iwm_softc *);
+int iwm_public_scan(struct iwm_softc *);
+void iwm_scan_stop_request(struct iwm_softc *);
+int iwm_scan_attach(struct iwm_softc *);
+int iwm_scan_detach(struct iwm_softc *);
 int iwm_run_free(struct iwm_softc *);
 int iwm_run_quiesce(struct iwm_softc *);
 uint_t iwm_active_intr(struct iwm_softc *, uint32_t, uint32_t);

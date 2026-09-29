@@ -352,14 +352,7 @@ struct iwm_runtime {
 	struct iwm_dma_info rx[IWM_RX_RING_COUNT];
 	uint8_t *nvm[IWM_NVM_NUM_OF_SECTIONS];
 	size_t nvm_len[IWM_NVM_NUM_OF_SECTIONS];
-	uint8_t mac[6];
-	uint16_t nvm_version;
-	uint32_t radio_cfg;
-	uint32_t sku;
-	uint8_t tx_ant;
-	uint8_t rx_ant;
-	uint16_t channels[51];
-	uint16_t lar;
+	boolean_t cancel_requested;
 	boolean_t full_cycle;
 	uint_t image;
 	uint_t generation;
@@ -1170,9 +1163,12 @@ iwm_scan_xmit(ieee80211com_t *ic, mblk_t *mp, uint8_t type)
 	_NOTE(ARGUNUSED(type))
 	freemsg(mp);
 	mutex_enter(&sc->lock);
-	sc->run->scan.xmit_calls++;
-	sc->run->error = EACCES;
-	cv_broadcast(&sc->run->cv);
+	sc->xmit_rejected++;
+	if (sc->run != NULL) {
+		sc->run->scan.xmit_calls++;
+		sc->run->error = EACCES;
+		cv_broadcast(&sc->run->cv);
+	}
 	mutex_exit(&sc->lock);
 	return (ENOTSUP);
 }
@@ -1181,19 +1177,25 @@ static int
 iwm_scan_newstate(ieee80211com_t *ic, enum ieee80211_state state, int arg)
 {
 	struct iwm_softc *sc = iwm_scan_softc(ic);
-	struct iwm_scan_state *s = &sc->run->scan;
+	boolean_t allowed;
 
 	_NOTE(ARGUNUSED(arg))
-	if (state != IEEE80211_S_INIT &&
-	    !(state == IEEE80211_S_SCAN && ic->ic_state == IEEE80211_S_INIT &&
-	    s->running && !s->cancelled)) {
-		mutex_enter(&sc->lock);
-		s->state_violations++;
-		sc->run->error = EACCES;
-		cv_broadcast(&sc->run->cv);
-		mutex_exit(&sc->lock);
-		return (ENOTSUP);
+	mutex_enter(&sc->lock);
+	allowed = state == IEEE80211_S_INIT ||
+	    (state == IEEE80211_S_SCAN && ic->ic_state == IEEE80211_S_INIT &&
+	    sc->run != NULL && sc->run->scan.running &&
+	    !sc->run->scan.cancelled);
+	if (!allowed) {
+		sc->state_rejected++;
+		if (sc->run != NULL) {
+			sc->run->scan.state_violations++;
+			sc->run->error = EACCES;
+			cv_broadcast(&sc->run->cv);
+		}
 	}
+	mutex_exit(&sc->lock);
+	if (!allowed)
+		return (ENOTSUP);
 	mutex_enter(&ic->ic_genlock);
 	ic->ic_state = state;
 	mutex_exit(&ic->ic_genlock);
@@ -1201,19 +1203,19 @@ iwm_scan_newstate(ieee80211com_t *ic, enum ieee80211_state state, int arg)
 }
 
 /* Called in thread context without sc->lock; NVM is already validated. */
-static int
+int
 iwm_scan_attach(struct iwm_softc *sc)
 {
-	struct iwm_runtime *r = sc->run;
-	struct iwm_scan_state *s = &r->scan;
 	ieee80211com_t *ic = &sc->ic;
-	uint_t i;
+	uint_t i, count = 0;
 	static const struct ieee80211_rateset rates_b =
 	    { 4, { 2, 4, 11, 22 } };
 	static const struct ieee80211_rateset rates_g =
 	    { 12, { 2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108 } };
 
-	if (s->attached || !r->tx_ant || !r->rx_ant || !(r->sku & 1) ||
+	if (sc->net_attached || !sc->identity.valid ||
+	    !sc->identity.tx_ant || !sc->identity.rx_ant ||
+	    !(sc->identity.sku & 1) ||
 	    sc->fw.scan_channels != IWM_SCAN_CHANNELS ||
 	    !(sc->fw.capa[0] & (1U << 2)) || !(sc->fw.api[1] & 1) ||
 	    (sc->fw.api[1] & ((1U << 10) | (1U << 26))))
@@ -1225,24 +1227,25 @@ iwm_scan_attach(struct iwm_softc *sc)
 	ic->ic_curmode = IEEE80211_MODE_11G;
 	ic->ic_maxrssi = 100;
 	ic->ic_xmit = iwm_scan_xmit;
-	bcopy(r->mac, ic->ic_macaddr, sizeof (ic->ic_macaddr));
+	bcopy(sc->identity.mac, ic->ic_macaddr, sizeof (ic->ic_macaddr));
 	ic->ic_sup_rates[IEEE80211_MODE_11B] = rates_b;
 	ic->ic_sup_rates[IEEE80211_MODE_11G] = rates_g;
-	for (i = 0; i < 14; i++) {
-		if (!(r->channels[i] & 1))
+	for (i = 0; i < 13; i++) {
+		if (!(sc->identity.channels[i] & 1))
 			continue;
-		s->channel[s->channels++] = i + 1;
+		count++;
 		ic->ic_sup_channels[i + 1].ich_freq =
 		    ieee80211_ieee2mhz(i + 1, IEEE80211_CHAN_2GHZ);
 		ic->ic_sup_channels[i + 1].ich_flags = IEEE80211_CHAN_CCK |
 		    IEEE80211_CHAN_OFDM | IEEE80211_CHAN_DYN |
 		    IEEE80211_CHAN_2GHZ | IEEE80211_CHAN_PASSIVE;
 	}
-	if (s->channels == 0)
+	if (count == 0)
 		return (ENOENT);
 	ieee80211_attach(ic);
-	s->attached = B_TRUE;
-	s->newstate = ic->ic_newstate;
+	sc->net_attached = B_TRUE;
+	if (sc->run != NULL)
+		sc->run->scan.attached = B_TRUE;
 	ic->ic_newstate = iwm_scan_newstate;
 	ieee80211_media_init(ic);
 	return (iwm_checkpoint(sc, "net80211-attached"));
@@ -1268,22 +1271,23 @@ iwm_scan_drain(struct iwm_softc *sc)
 }
 
 /* Same thread as native input; no callback can survive this boundary. */
-static int
+int
 iwm_scan_detach(struct iwm_softc *sc)
 {
-	struct iwm_scan_state *s = &sc->run->scan;
-
-	if (!s->attached)
+	if (!sc->net_attached)
 		return (0);
 	mutex_enter(&sc->lock);
-	ASSERT(!s->outstanding || sc->run->stopped);
-	iwm_scan_drain(sc);
+	if (sc->run != NULL) {
+		ASSERT(!sc->run->scan.outstanding || sc->run->stopped);
+		iwm_scan_drain(sc);
+		sc->run->scan.attached = B_FALSE;
+	}
 	mutex_exit(&sc->lock);
 	ieee80211_cancel_scan(&sc->ic);
 	sc->ic.ic_flags &= ~IEEE80211_F_SCANONLY;
 	(void) iwm_scan_newstate(&sc->ic, IEEE80211_S_INIT, 0);
 	ieee80211_detach(&sc->ic);
-	s->attached = B_FALSE;
+	sc->net_attached = B_FALSE;
 	return (iwm_checkpoint(sc, "net80211-detached"));
 }
 
@@ -1724,6 +1728,8 @@ iwm_scan_configure(struct iwm_softc *sc)
 	    !(sc->fw.capa[0] & (1U << 12)) ||
 	    !(sc->fw.api[0] & (1U << 30)))
 		return (ENOTSUP);
+	if (s->configured)
+		return (0);
 	bzero(&queue, sizeof (queue));
 	queue.sta_id = IWM_AUX_STA;
 	queue.tid = 8;
@@ -1763,14 +1769,14 @@ iwm_scan_configure(struct iwm_softc *sc)
 	flags = 1U | (1U << 2) | (15U << 8) | (7U << 13) |
 	    (1U << 17) | (s->channels << 26);
 	cfg->flags = LE_32(flags);
-	cfg->tx_chains = LE_32(sc->run->tx_ant);
-	cfg->rx_chains = LE_32(sc->run->rx_ant);
+	cfg->tx_chains = LE_32(sc->identity.tx_ant);
+	cfg->rx_chains = LE_32(sc->identity.rx_ant);
 	cfg->legacy_rates = LE_32(0x0fff0fff);
 	cfg->dwell_active = 10;
 	cfg->dwell_passive = 110;
 	cfg->dwell_fragmented = 44;
 	cfg->dwell_extended = 90;
-	bcopy(sc->run->mac, cfg->mac_addr, 6);
+	bcopy(sc->identity.mac, cfg->mac_addr, 6);
 	cfg->bcast_sta_id = IWM_AUX_STA;
 	bcopy(s->channel, cfg->channel_array, s->channels);
 	if ((error = iwm_checkpoint(sc, "scan-config-zero-contexts")) != 0)
@@ -1791,7 +1797,8 @@ iwm_scan_deliver(struct iwm_softc *sc)
 	uint_t subtype;
 	int error = 0;
 
-	while (s->queued != 0 && s->error == 0 && sc->run->error == 0) {
+	while (s->queued != 0 && s->error == 0 && sc->run->error == 0 &&
+	    !sc->run->cancel_requested) {
 		f = s->frames[s->head];
 		s->frames[s->head].mp = NULL;
 		s->head = (s->head + 1) % IWM_SCAN_RX_LIMIT;
@@ -1823,7 +1830,11 @@ iwm_scan_deliver(struct iwm_softc *sc)
 		if (error != 0)
 			return (error);
 	}
-	return (s->error != 0 ? s->error : sc->run->error);
+	if (s->error != 0)
+		return (s->error);
+	if (sc->run->error != 0)
+		return (sc->run->error);
+	return (sc->run->cancel_requested ? ECANCELED : 0);
 }
 
 static void
@@ -1897,7 +1908,9 @@ iwm_passive_scan(struct iwm_softc *sc)
 		return (EBUSY);
 	if ((error = iwm_scan_configure(sc)) != 0)
 		return (error);
-	if ((error = iwm_scan_request(s, sc->run->mac, request,
+	if (sc->run->cancel_requested)
+		return (ECANCELED);
+	if ((error = iwm_scan_request(s, sc->identity.mac, request,
 	    sizeof (request))) != 0)
 		return (error);
 	s->running = B_TRUE;
@@ -1907,6 +1920,8 @@ iwm_passive_scan(struct iwm_softc *sc)
 	sc->ic.ic_flags |= IEEE80211_F_SCAN | IEEE80211_F_SCANONLY;
 	error = iwm_scan_newstate(&sc->ic, IEEE80211_S_SCAN, 0);
 	mutex_enter(&sc->lock);
+	if (error == 0 && sc->run->cancel_requested)
+		error = ECANCELED;
 	if (error == 0)
 		error = iwm_checkpoint(sc, "scan-submit-zero-contexts");
 	if (error == 0) {
@@ -1921,6 +1936,10 @@ iwm_passive_scan(struct iwm_softc *sc)
 	/* 110ms dwell + 300 TU adaptive budget per channel, plus 2s. */
 	end = ddi_get_lbolt() + iwm_scan_ticks(s);
 	while (error == 0 && sc->run->error == 0 && s->error == 0) {
+		if (sc->run->cancel_requested) {
+			error = ECANCELED;
+			break;
+		}
 		error = iwm_scan_deliver(sc);
 		if (error != 0 || s->complete)
 			break;
@@ -1966,7 +1985,7 @@ iwm_tx_ant_config(struct iwm_softc *sc)
 {
 	uint32_t mask = (sc->fw.phy_config >> 16) & 7;
 
-	mask &= sc->run->tx_ant;
+	mask &= sc->identity.tx_ant;
 	if (mask == 0)
 		return (EINVAL);
 	mask = LE_32(mask);
@@ -2171,44 +2190,51 @@ iwm_nvm_parse(struct iwm_softc *sc)
 		    (ulong_t)r->nvm_len[10], (ulong_t)r->nvm_len[11]);
 		return (EINVAL);
 	}
-	r->nvm_version = iwm_u16(r->nvm[1]);
-	laroff = r->nvm_version < 0xe39 ? IWM_NVM_LAR_OFFSET_8000_OLD :
+	sc->identity.nvm_version = iwm_u16(r->nvm[1]);
+	laroff = sc->identity.nvm_version < 0xe39 ?
+	    IWM_NVM_LAR_OFFSET_8000_OLD :
 	    IWM_NVM_LAR_OFFSET_8000;
 	if (laroff * 2 + 2 > r->nvm_len[3])
 		return (EINVAL);
-	r->lar = iwm_u16(r->nvm[3] + laroff * 2);
-	r->radio_cfg = iwm_u32(r->nvm[12]);
-	r->sku = iwm_u32(r->nvm[12] + 4);
-	r->tx_ant = IWM_NVM_RF_CFG_TX_ANT_MSK_8000(r->radio_cfg);
-	r->rx_ant = IWM_NVM_RF_CFG_RX_ANT_MSK_8000(r->radio_cfg);
+	sc->identity.lar = iwm_u16(r->nvm[3] + laroff * 2);
+	sc->identity.radio_cfg = iwm_u32(r->nvm[12]);
+	sc->identity.sku = iwm_u32(r->nvm[12] + 4);
+	sc->identity.tx_ant =
+	    IWM_NVM_RF_CFG_TX_ANT_MSK_8000(sc->identity.radio_cfg);
+	sc->identity.rx_ant =
+	    IWM_NVM_RF_CFG_RX_ANT_MSK_8000(sc->identity.radio_cfg);
 	if (r->nvm_len[11] >= 8)
-		bcopy(r->nvm[11] + 2, r->mac, 6);
-	if (!iwm_mac_valid(r->mac)) {
+		bcopy(r->nvm[11] + 2, sc->identity.mac, 6);
+	if (!iwm_mac_valid(sc->identity.mac)) {
 		if (r->nvm_len[10] == 0 || iwm_nic_lock(sc) != 0)
 			return (EINVAL);
 		a = iwm_prph_read(sc, IWM_WFMP_MAC_ADDR_0);
 		b = iwm_prph_read(sc, IWM_WFMP_MAC_ADDR_1);
 		iwm_nic_unlock(sc);
-		r->mac[0] = a >> 24;
-		r->mac[1] = a >> 16;
-		r->mac[2] = a >> 8;
-		r->mac[3] = a;
-		r->mac[4] = b >> 8;
-		r->mac[5] = b;
+		sc->identity.mac[0] = a >> 24;
+		sc->identity.mac[1] = a >> 16;
+		sc->identity.mac[2] = a >> 8;
+		sc->identity.mac[3] = a;
+		sc->identity.mac[4] = b >> 8;
+		sc->identity.mac[5] = b;
 	}
-	if (!iwm_mac_valid(r->mac) || r->tx_ant == 0 || r->rx_ant == 0)
+	if (!iwm_mac_valid(sc->identity.mac) || sc->identity.tx_ant == 0 ||
+	    sc->identity.rx_ant == 0)
 		return (EINVAL);
 	dev_err(sc->dip, CE_NOTE, "!iwm NVM version=%04x radio=%08x sku=%08x "
 	    "TXant=%x RXant=%x bands24=%u bands5=%u LAR=%04x hwaddrs=%u",
-	    r->nvm_version, r->radio_cfg, r->sku, r->tx_ant, r->rx_ant,
-	    !!(r->sku & IWM_NVM_SKU_CAP_BAND_24GHZ),
-	    !!(r->sku & IWM_NVM_SKU_CAP_BAND_52GHZ), r->lar,
+	    sc->identity.nvm_version, sc->identity.radio_cfg, sc->identity.sku,
+	    sc->identity.tx_ant, sc->identity.rx_ant,
+	    !!(sc->identity.sku & IWM_NVM_SKU_CAP_BAND_24GHZ),
+	    !!(sc->identity.sku & IWM_NVM_SKU_CAP_BAND_52GHZ), sc->identity.lar,
 	    iwm_u16(r->nvm[1] + 6));
 	dev_err(sc->dip, CE_NOTE, "!iwm NVM MAC %02x:%02x:%02x:%02x:%02x:%02x",
-	    r->mac[0], r->mac[1], r->mac[2], r->mac[3], r->mac[4], r->mac[5]);
+	    sc->identity.mac[0], sc->identity.mac[1], sc->identity.mac[2],
+	    sc->identity.mac[3], sc->identity.mac[4], sc->identity.mac[5]);
 	for (i = 0; i < sizeof (channels); i++) {
-		r->channels[i] = iwm_u16(r->nvm[3] + 2 * i);
+		sc->identity.channels[i] = iwm_u16(r->nvm[3] + 2 * i);
 	}
+	sc->identity.valid = B_TRUE;
 	r->state = IWM_NVM_PARSED;
 	return (iwm_checkpoint(sc, "NVM-parsed"));
 }
@@ -2546,7 +2572,10 @@ iwm_run_free(struct iwm_softc *sc)
 	mutex_exit(&sc->lock);
 	if (iwm_intr_disable(sc) != 0 || error != 0)
 		return (EIO);
-	scan_error = iwm_scan_detach(sc);
+	scan_error = sc->public_enabled ? 0 : iwm_scan_detach(sc);
+	mutex_enter(&sc->lock);
+	iwm_scan_drain(sc);
+	mutex_exit(&sc->lock);
 	for (i = IWM_PAGING_BLOCKS - 1; i >= 0; i--) {
 		if (iwm_dma_free(&r->paging[i]) != 0)
 			return (EIO);
@@ -2576,10 +2605,15 @@ iwm_run_free(struct iwm_softc *sc)
 	}
 	if (iwm_dma_free(&r->scheduler) != 0 || iwm_dma_free(&r->transfer) != 0)
 		return (EIO);
-	iwm_fw_free(&sc->fw);
+	for (i = IWM_PASSIVE_DMA_COUNT - 1; i >= 0; i--) {
+		if (iwm_dma_free(&sc->dma[i]) != 0)
+			return (EIO);
+	}
+	mutex_enter(&sc->lock);
+	sc->run = NULL;
+	mutex_exit(&sc->lock);
 	cv_destroy(&r->cv);
 	kmem_free(r, sizeof (*r));
-	sc->run = NULL;
 	return (scan_error);
 }
 
@@ -2627,8 +2661,10 @@ iwm_run_alloc(struct iwm_softc *sc)
 		if (iwm_sync(&r->rx[i], DDI_DMA_SYNC_FORDEV) != 0)
 			return (EIO);
 	}
-	for (i = 0; i < IWM_NVM_NUM_OF_SECTIONS; i++)
-		r->nvm[i] = kmem_zalloc(IWM_NVM_LIMIT, KM_SLEEP);
+	if (!sc->identity.valid) {
+		for (i = 0; i < IWM_NVM_NUM_OF_SECTIONS; i++)
+			r->nvm[i] = kmem_zalloc(IWM_NVM_LIMIT, KM_SLEEP);
+	}
 	return (iwm_checkpoint(sc, "runtime-allocated"));
 }
 
@@ -2646,20 +2682,37 @@ iwm_init_nvm(struct iwm_softc *sc)
 	ASSERT(sc->run == NULL);
 	r = kmem_zalloc(sizeof (*r), KM_SLEEP);
 	cv_init(&r->cv, NULL, CV_DRIVER, NULL);
+	mutex_enter(&sc->lock);
 	sc->run = r;
+	mutex_exit(&sc->lock);
 	r->image = IWM_FW_INIT;
-	r->generation = 1;
+	r->generation = ++sc->generation;
 	r->full_cycle = ddi_prop_get_int(DDI_DEV_T_ANY, sc->dip,
 	    DDI_PROP_DONTPASS, "iwm-full-init", 0) != 0;
 	r->scan.enabled = ddi_prop_get_int(DDI_DEV_T_ANY, sc->dip,
 	    DDI_PROP_DONTPASS, "iwm-passive-scan", 0) != 0;
+	if (sc->public_enabled) {
+		r->full_cycle = sc->identity.valid;
+		r->scan.enabled = sc->identity.valid;
+		r->scan.attached = sc->net_attached;
+	}
+	if (r->scan.enabled) {
+		uint_t i;
+
+		for (i = 0; i < 13; i++) {
+			if (sc->identity.channels[i] & 1)
+				r->scan.channel[r->scan.channels++] = i + 1;
+		}
+	}
 	if (r->scan.enabled && !r->full_cycle)
 		return (EINVAL);
-	if ((error = iwm_fw_read(sc)) != 0)
-		return (error);
-	r->state = IWM_FW_LOADED;
-	if ((error = iwm_fw_parse(&sc->fw)) != 0)
-		return (error);
+	if (!sc->identity.valid) {
+		if ((error = iwm_fw_read(sc)) != 0)
+			return (error);
+		r->state = IWM_FW_LOADED;
+		if ((error = iwm_fw_parse(&sc->fw)) != 0)
+			return (error);
+	}
 	r->state = IWM_FW_PARSED;
 	if (iwm_checkpoint(sc, "firmware-parsed") != 0)
 		return (EIO);
@@ -2670,6 +2723,8 @@ iwm_init_nvm(struct iwm_softc *sc)
 	    "command-q=%u PHY=%08x timeout=%u us", sc->fw.version[0],
 	    sc->fw.version[1], sc->fw.version[2], r->cmdqid,
 	    sc->fw.phy_config, IWM_WAIT_US);
+	if ((error = iwm_base_dma_alloc(sc)) != 0)
+		return (error);
 	if ((error = iwm_run_alloc(sc)) != 0)
 		return (error);
 	if (r->full_cycle && (error = iwm_paging_alloc(sc)) != 0)
@@ -2691,11 +2746,20 @@ iwm_init_nvm(struct iwm_softc *sc)
 		error = iwm_upload(sc);
 	if (error == 0)
 		error = iwm_post_alive(sc);
-	if (error == 0)
+	if (error == 0 && !sc->identity.valid)
 		error = iwm_nvm(sc);
-	if (error == 0 && r->scan.enabled) {
+	if (error == 0 && r->scan.enabled && !sc->public_enabled) {
 		mutex_exit(&sc->lock);
 		error = iwm_scan_attach(sc);
+		if (error == 0) {
+			uint_t i;
+
+			for (i = 0; i < 13; i++) {
+				if (sc->identity.channels[i] & 1)
+					r->scan.channel[r->scan.channels++] =
+					    i + 1;
+			}
+		}
 		mutex_enter(&sc->lock);
 	}
 	if (error == 0 && r->full_cycle)
@@ -2722,14 +2786,19 @@ iwm_init_nvm(struct iwm_softc *sc)
 		if (error == 0)
 			error = iwm_queues_check(sc, "REGULAR-idle");
 	}
-	if (error == 0 && r->scan.enabled) {
+	if (error == 0 && sc->public_enabled && r->full_cycle) {
+		mutex_exit(&sc->lock);
+		return (0);
+	}
+	if (error == 0 && r->scan.enabled && !sc->public_enabled) {
 		error = iwm_nic_lock(sc);
 		if (error == 0) {
 			error = iwm_passive_scan(sc);
 			iwm_nic_unlock(sc);
 		}
 	}
-	if (r->scan.attached && !r->scan.outstanding) {
+	if (!sc->public_enabled && r->scan.attached &&
+	    !r->scan.outstanding) {
 		mutex_exit(&sc->lock);
 		host_error = iwm_scan_detach(sc);
 		if (error == 0)
@@ -2752,7 +2821,7 @@ iwm_init_nvm(struct iwm_softc *sc)
 	host_error = iwm_intr_disable(sc);
 	if (stop_error != 0 || host_error != 0)
 		return (EIO);
-	host_error = iwm_scan_detach(sc);
+	host_error = sc->public_enabled ? 0 : iwm_scan_detach(sc);
 	if (error == 0)
 		error = host_error;
 	/* Include errors from the final callback, now drained by DDI. */
@@ -2764,5 +2833,95 @@ iwm_init_nvm(struct iwm_softc *sc)
 		    "private-scan=%u no MAC; checkpoints=%d", r->full_cycle,
 		    r->scan.enabled,
 		    sc->attach_step);
+	return (error);
+}
+
+/* Public operation ownership serializes these thread-context entrypoints. */
+int
+iwm_preinit(struct iwm_softc *sc)
+{
+	int error, cleanup;
+
+	ASSERT(!sc->identity.valid && sc->run == NULL);
+	error = iwm_init_nvm(sc);
+	cleanup = iwm_run_free(sc);
+	if (error != 0 || cleanup != 0) {
+		sc->identity.valid = B_FALSE;
+		return (error != 0 ? error : cleanup);
+	}
+	return (sc->identity.valid ? 0 : EINVAL);
+}
+
+int
+iwm_runtime_start(struct iwm_softc *sc)
+{
+	int error;
+
+	if (!sc->identity.valid || !sc->net_attached || sc->run != NULL)
+		return (EINVAL);
+	error = iwm_init_nvm(sc);
+	if (error != 0)
+		sc->runtime_stop_error = iwm_run_free(sc);
+	return (error);
+}
+
+void
+iwm_scan_stop_request(struct iwm_softc *sc)
+{
+	mutex_enter(&sc->lock);
+	if (sc->run != NULL) {
+		sc->run->cancel_requested = B_TRUE;
+		cv_broadcast(&sc->run->cv);
+	}
+	mutex_exit(&sc->lock);
+}
+
+int
+iwm_runtime_stop(struct iwm_softc *sc)
+{
+	/* A SCAN owner must finish cancellation/drain before STOP can enter. */
+	return (iwm_run_free(sc));
+}
+
+int
+iwm_public_scan(struct iwm_softc *sc)
+{
+	struct iwm_scan_state *s;
+	boolean_t configured, auxq, auxsta;
+	uint_t i;
+	int error;
+
+	mutex_enter(&sc->lock);
+	if (sc->run == NULL || !sc->net_attached ||
+	    sc->ic.ic_state != IEEE80211_S_INIT || sc->run->scan.running ||
+	    sc->run->scan.outstanding || sc->run->cancel_requested) {
+		mutex_exit(&sc->lock);
+		return (EBUSY);
+	}
+	s = &sc->run->scan;
+	configured = s->configured;
+	auxq = s->aux_queue;
+	auxsta = s->aux_station;
+	ASSERT(!s->delivering && s->queued == 0);
+	bzero(s, sizeof (*s));
+	s->enabled = s->attached = B_TRUE;
+	s->configured = configured;
+	s->aux_queue = auxq;
+	s->aux_station = auxsta;
+	for (i = 0; i < 13; i++) {
+		if (sc->identity.channels[i] & 1)
+			s->channel[s->channels++] = i + 1;
+	}
+	sc->scan_generation++;
+	error = iwm_nic_lock(sc);
+	if (error == 0) {
+		error = iwm_passive_scan(sc);
+		iwm_nic_unlock(sc);
+	}
+	mutex_exit(&sc->lock);
+	if (error != 0) {
+		/* No partial/stale results are advertised for a failed scan. */
+		ieee80211_node_table_reset(&sc->ic.ic_scan);
+	}
 	return (error);
 }

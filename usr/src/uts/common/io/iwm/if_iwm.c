@@ -22,11 +22,12 @@
  *
  * Passive attach by default. The iwm-init-nvm property opts into one bounded
  * INIT firmware/NVM cycle; iwm-full-init additionally calibrates and restarts
- * REGULAR. Both stop before attach returns. No MAC registration
- * or network data path exists.
+ * REGULAR. The iwm-public-scan opt-in publishes only passive scanning;
+ * its attach-time INIT bootstrap stops before public registration.
  */
 
 #include <sys/types.h>
+#include <sys/sysmacros.h>
 #include <sys/conf.h>
 #include <sys/modctl.h>
 #include <sys/ddi.h>
@@ -38,6 +39,10 @@
 #include <sys/firmload.h>
 #include <sys/mac_provider.h>
 #include <sys/atomic.h>
+#include <sys/strsun.h>
+#include <sys/policy.h>
+#include <sys/stat.h>
+#include <inet/wifi_ioctl.h>
 #include "if_iwmvar.h"
 
 /* The only hardware identity admitted by the resource mapping helper. */
@@ -62,6 +67,7 @@ static void *iwm_state;
 static uint32_t iwm_retained;
 
 static int iwm_cleanup(struct iwm_softc *);
+static int iwm_public_unregister(struct iwm_softc *);
 
 /* Only recognised causes may be acknowledged by the dormant handler. */
 #define	IWM_PASSIVE_INT_CAUSES	(IWM_CSR_INT_BIT_FH_RX | \
@@ -85,6 +91,21 @@ static const struct {
 	{ "rx-descriptors", IWM_RX_RING_COUNT * sizeof (uint32_t), 256 },
 	{ "rx-status", sizeof (struct iwm_rb_status), 16 }
 };
+
+int
+iwm_base_dma_alloc(struct iwm_softc *sc)
+{
+	uint_t i;
+
+	for (i = 0; i < IWM_PASSIVE_DMA_COUNT; i++) {
+		if (sc->dma[i].bound)
+			continue;
+		if (iwm_dma_alloc(sc, &sc->dma[i], iwm_passive_dma[i].size,
+		    iwm_passive_dma[i].align, DDI_DMA_RDWR) != 0)
+			return (ENOMEM);
+	}
+	return (0);
+}
 
 static const ddi_device_acc_attr_t iwm_reg_attr = {
 	DDI_DEVICE_ATTR_V0, DDI_STRUCTURE_LE_ACC, DDI_STRICTORDER_ACC,
@@ -558,8 +579,15 @@ iwm_cleanup(struct iwm_softc *sc)
 	int mask_error = 0;
 	uint16_t command;
 
+	if (sc->public_enabled && sc->lock_initialized &&
+	    iwm_public_unregister(sc) != 0)
+		return (EIO);
 	if (iwm_run_free(sc) != 0)
 		return (EIO);
+	if (sc->net_attached && iwm_scan_detach(sc) != 0)
+		return (EIO);
+	iwm_fw_free(&sc->fw);
+	bzero(&sc->identity, sizeof (sc->identity));
 	if (sc->csr_valid && iwm_mask(sc) != 0)
 		mask_error = EIO;
 	if (iwm_intr_disable(sc) != 0)
@@ -595,7 +623,474 @@ iwm_cleanup(struct iwm_softc *sc)
 	}
 	iwm_pci_unmap(sc);
 	sc->csr_valid = B_FALSE;
+	if (sc->operation_initialized) {
+		cv_destroy(&sc->operation_cv);
+		mutex_destroy(&sc->operation_lock);
+		sc->operation_initialized = B_FALSE;
+	}
 	return (0);
+}
+
+/*
+ * Public operation ownership is separate from the MSI/command mutex. Owners
+ * drop operation_lock before hardware or framework calls. STOP signals the
+ * scan owner under lock, then waits; it never runs a second scan drain.
+ */
+static int
+iwm_operation_enter(struct iwm_softc *sc, enum iwm_operation operation)
+{
+	clock_t end = ddi_get_lbolt() + drv_usectohz(30000000);
+	int error = 0;
+
+	mutex_enter(&sc->operation_lock);
+	if (operation == IWM_OP_STOP) {
+		sc->stop_requested = B_TRUE;
+		if (sc->operation == IWM_OP_SCAN)
+			iwm_scan_stop_request(sc);
+	}
+	for (;;) {
+		if (sc->detach_requested && operation != IWM_OP_STOP &&
+		    operation != IWM_OP_DETACH) {
+			error = ENXIO;
+			break;
+		}
+		if (sc->operation == IWM_OP_NONE) {
+			if (sc->stop_requested && operation != IWM_OP_STOP &&
+			    operation != IWM_OP_DETACH) {
+				error = EBUSY;
+				break;
+			}
+			sc->operation = operation;
+			break;
+		}
+		if (operation == IWM_OP_SCAN) {
+			error = EBUSY;
+			break;
+		}
+		if (cv_timedwait(&sc->operation_cv, &sc->operation_lock,
+		    end) == -1) {
+			error = ETIMEDOUT;
+			break;
+		}
+	}
+	mutex_exit(&sc->operation_lock);
+	return (error);
+}
+
+static void
+iwm_operation_exit(struct iwm_softc *sc)
+{
+	mutex_enter(&sc->operation_lock);
+	ASSERT(sc->operation != IWM_OP_NONE);
+	if (sc->operation == IWM_OP_STOP)
+		sc->stop_requested = B_FALSE;
+	sc->operation = IWM_OP_NONE;
+	cv_broadcast(&sc->operation_cv);
+	mutex_exit(&sc->operation_lock);
+}
+
+static int
+iwm_m_start(void *arg)
+{
+	struct iwm_softc *sc = arg;
+	int error;
+
+	if ((error = iwm_operation_enter(sc, IWM_OP_START)) != 0)
+		return (error);
+	if (!sc->mac_registered || !sc->net_attached ||
+	    !sc->identity.valid || !sc->minor_created)
+		error = ENXIO;
+	else if (sc->runtime_started)
+		error = 0;
+	else if (sc->runtime_stop_error != 0)
+		error = sc->runtime_stop_error;
+	else {
+		error = iwm_runtime_start(sc);
+		if (error == 0)
+			sc->runtime_started = B_TRUE;
+	}
+	iwm_operation_exit(sc);
+	return (error);
+}
+
+static void
+iwm_m_stop(void *arg)
+{
+	struct iwm_softc *sc = arg;
+	int error;
+
+	error = iwm_operation_enter(sc, IWM_OP_STOP);
+	if (error != 0) {
+		dev_err(sc->dip, CE_WARN, "!iwm public stop owner error=%d",
+		    error);
+		return;
+	}
+	error = iwm_runtime_stop(sc);
+	sc->runtime_stop_error = error;
+	if (error == 0)
+		sc->runtime_started = B_FALSE;
+	else
+		dev_err(sc->dip, CE_WARN, "!iwm runtime stop error=%d", error);
+	iwm_operation_exit(sc);
+}
+
+static mblk_t *
+iwm_m_tx(void *arg, mblk_t *mp)
+{
+	struct iwm_softc *sc = arg;
+	mblk_t *next;
+
+	atomic_inc_32(&sc->tx_rejected);
+	while (mp != NULL) {
+		next = mp->b_next;
+		mp->b_next = NULL;
+		freemsg(mp);
+		mp = next;
+	}
+	return (NULL);
+}
+
+static int
+iwm_m_unicst(void *arg, const uint8_t *address)
+{
+	struct iwm_softc *sc = arg;
+
+	return (bcmp(address, sc->identity.mac, IEEE80211_ADDR_LEN) == 0 ?
+	    0 : ENOTSUP);
+}
+
+static int
+iwm_m_multicst(void *arg, boolean_t add, const uint8_t *address)
+{
+	struct iwm_softc *sc = arg;
+
+	_NOTE(ARGUNUSED(add, address))
+	atomic_inc_32(&sc->multicast_calls);
+	return (0);
+}
+
+static int
+iwm_m_promisc(void *arg, boolean_t on)
+{
+	_NOTE(ARGUNUSED(arg, on))
+	return (ENOTSUP);
+}
+
+static int
+iwm_m_stat(void *arg, uint_t stat, uint64_t *value)
+{
+	_NOTE(ARGUNUSED(arg))
+	switch (stat) {
+	case MAC_STAT_IFSPEED:
+	case MAC_STAT_IPACKETS:
+	case MAC_STAT_OPACKETS:
+	case MAC_STAT_RBYTES:
+	case MAC_STAT_OBYTES:
+	case MAC_STAT_IERRORS:
+	case MAC_STAT_OERRORS:
+		*value = 0;
+		return (0);
+	default:
+		return (ENOTSUP);
+	}
+}
+
+/* The private snapshot contains native ABI values, never node pointers. */
+struct iwm_ess_snapshot {
+	struct iwm_softc *sc;
+	wl_ess_list_t *list;
+	size_t size;
+	int error;
+};
+
+static void
+iwm_ess_node(void *arg, struct ieee80211_node *node)
+{
+	struct iwm_ess_snapshot *snapshot = arg;
+	struct iwm_softc *sc = snapshot->sc;
+	wl_ess_list_t *list = snapshot->list;
+	wl_ess_conf_t *entry;
+	wl_erp_t *erp;
+	size_t count = list->wl_ess_list_num;
+	uint_t channel, i, nrates, rssi;
+	static const uint8_t rates[] =
+	    { 2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108 };
+
+	if (snapshot->error != 0 ||
+	    IEEE80211_ADDR_EQ(node->in_macaddr, sc->identity.mac))
+		return;
+	if (node->in_esslen > IEEE80211_NWID_LEN ||
+	    node->in_rates.ir_nrates > sizeof (node->in_rates.ir_rates)) {
+		snapshot->error = EPROTO;
+		return;
+	}
+	for (channel = 1; channel <= 13; channel++) {
+		if (node->in_chan == &sc->ic.ic_sup_channels[channel])
+			break;
+	}
+	if (channel > 13 ||
+	    !(sc->identity.channels[channel - 1] & 1)) {
+		snapshot->error = EPROTO;
+		return;
+	}
+	for (i = 0; i < node->in_rates.ir_nrates; i++) {
+		uint_t j;
+		uint8_t rate = node->in_rates.ir_rates[i] & IEEE80211_RATE_VAL;
+
+		for (j = 0; j < sizeof (rates); j++) {
+			if (rates[j] == rate)
+				break;
+		}
+		if (j == sizeof (rates)) {
+			snapshot->error = EPROTO;
+			return;
+		}
+	}
+	if (snapshot->size < offsetof(wl_ess_list_t, wl_ess_list_ess) ||
+	    count >= (snapshot->size -
+	    offsetof(wl_ess_list_t, wl_ess_list_ess)) / sizeof (*entry)) {
+		snapshot->error = ENOSPC;
+		return;
+	}
+	entry = &list->wl_ess_list_ess[count];
+	entry->wl_ess_conf_length = sizeof (*entry);
+	entry->wl_ess_conf_essid.wl_essid_length = node->in_esslen;
+	bcopy(node->in_essid, entry->wl_ess_conf_essid.wl_essid_essid,
+	    node->in_esslen);
+	bcopy(node->in_bssid, entry->wl_ess_conf_bssid, IEEE80211_ADDR_LEN);
+	entry->wl_ess_conf_wepenabled =
+	    node->in_capinfo & IEEE80211_CAPINFO_PRIVACY ? WL_ENC_WEP :
+	    WL_NOENCRYPTION;
+	entry->wl_ess_conf_bsstype = node->in_capinfo & IEEE80211_CAPINFO_ESS ?
+	    WL_BSS_BSS : WL_BSS_IBSS;
+	entry->wl_ess_conf_reserved[0] = node->in_wpa_ie != NULL;
+	rssi = MIN(node->in_rssi, 100);
+	entry->wl_ess_conf_sl = rssi == 0 ? 0 : rssi == 100 ? MAX_RSSI :
+	    rssi * MAX_RSSI / 100 + 1;
+	erp = &entry->wl_phy_conf.wl_phy_erp_conf;
+	erp->wl_erp_subtype = WL_ERP;
+	erp->wl_erp_channel = channel;
+	erp->wl_erp_have_short_preamble =
+	    !!(node->in_capinfo & IEEE80211_CAPINFO_SHORT_PREAMBLE);
+	erp->wl_erp_sst_enabled =
+	    !!(node->in_capinfo & IEEE80211_CAPINFO_SHORT_SLOTTIME);
+	nrates = MIN(node->in_rates.ir_nrates, MAX_SCAN_SUPPORT_RATES);
+	for (i = 0; i < nrates; i++)
+		entry->wl_supported_rates[i] =
+		    node->in_rates.ir_rates[node->in_rates.ir_nrates - i - 1];
+	list->wl_ess_list_num++;
+}
+
+static int
+iwm_m_getprop(void *arg, const char *name, mac_prop_id_t id,
+    uint_t size, void *value)
+{
+	struct iwm_softc *sc = arg;
+	struct iwm_ess_snapshot snapshot;
+	struct ieee80211_node *node;
+	size_t used;
+	int error;
+
+	_NOTE(ARGUNUSED(name))
+	if (id == MAC_PROP_WL_LINKSTATUS) {
+		if (size < sizeof (wl_linkstatus_t))
+			return (ENOSPC);
+		*(wl_linkstatus_t *)value = WL_NOTCONNECTED;
+		return (0);
+	}
+	if (id != MAC_PROP_WL_ESS_LIST)
+		return (ENOTSUP);
+	if (size < offsetof(wl_ess_list_t, wl_ess_list_ess))
+		return (ENOSPC);
+	if ((error = iwm_operation_enter(sc, IWM_OP_READ)) != 0)
+		return (error);
+	if (!sc->net_attached) {
+		iwm_operation_exit(sc);
+		return (ENXIO);
+	}
+	snapshot.sc = sc;
+	snapshot.size = MAX_BUF_LEN;
+	snapshot.list = kmem_zalloc(snapshot.size, KM_SLEEP);
+	snapshot.error = 0;
+	mutex_enter(&sc->ic.ic_scan.nt_nodelock);
+	for (node = list_head(&sc->ic.ic_scan.nt_node); node != NULL;
+	    node = list_next(&sc->ic.ic_scan.nt_node, node)) {
+		if (node->in_chan != IEEE80211_CHAN_ANYC)
+			iwm_ess_node(&snapshot, node);
+	}
+	mutex_exit(&sc->ic.ic_scan.nt_nodelock);
+	error = snapshot.error;
+	used = offsetof(wl_ess_list_t, wl_ess_list_ess) +
+	    snapshot.list->wl_ess_list_num * sizeof (wl_ess_conf_t);
+	if (error == 0 && used > size)
+		error = ENOSPC;
+	if (error == 0)
+		bcopy(snapshot.list, value, used);
+	kmem_free(snapshot.list, snapshot.size);
+	iwm_operation_exit(sc);
+	return (error);
+}
+
+static void
+iwm_m_propinfo(void *arg, const char *name, mac_prop_id_t id,
+    mac_prop_info_handle_t handle)
+{
+	_NOTE(ARGUNUSED(arg, name))
+	mac_prop_info_set_perm(handle,
+	    id == MAC_PROP_WL_LINKSTATUS || id == MAC_PROP_WL_ESS_LIST ?
+	    MAC_PROP_PERM_READ : 0);
+}
+
+static int
+iwm_scan_ioctl_check(const struct iocblk *ioc, const wldp_t *request,
+    size_t size, boolean_t chained)
+{
+	if (ioc->ioc_cmd != WLAN_COMMAND)
+		return (ENOTSUP);
+	if (chained || size < sizeof (*request) ||
+	    ioc->ioc_count < sizeof (*request) || ioc->ioc_count > size)
+		return (EINVAL);
+	if (request->wldp_type != NET_802_11 || request->wldp_id != WL_SCAN)
+		return (ENOTSUP);
+	if (request->wldp_length < WIFI_BUF_OFFSET ||
+	    request->wldp_length > MAX_BUF_LEN)
+		return (EINVAL);
+	return (0);
+}
+
+static void
+iwm_m_ioctl(void *arg, queue_t *queue, mblk_t *mp)
+{
+	struct iwm_softc *sc = arg;
+	struct iocblk *ioc;
+	wldp_t *request;
+	int error;
+
+	if (MBLKL(mp) < sizeof (*ioc)) {
+		merror(queue, mp, EINVAL);
+		return;
+	}
+	if (mp->b_cont == NULL) {
+		miocnak(queue, mp, 0, EINVAL);
+		return;
+	}
+	ioc = (void *)mp->b_rptr;
+	request = (void *)mp->b_cont->b_rptr;
+	error = iwm_scan_ioctl_check(ioc, request, MBLKL(mp->b_cont),
+	    mp->b_cont->b_cont != NULL);
+	if (error == 0)
+		error = secpolicy_dl_config(ioc->ioc_cr);
+	if (error != 0) {
+		miocnak(queue, mp, 0, error);
+		return;
+	}
+	error = iwm_operation_enter(sc, IWM_OP_SCAN);
+	if (error == 0) {
+		if (!sc->runtime_started || !sc->net_attached)
+			error = ENXIO;
+		else
+			error = iwm_public_scan(sc);
+		iwm_operation_exit(sc);
+	}
+	if (error != 0) {
+		miocnak(queue, mp, 0, error);
+		return;
+	}
+	request->wldp_length = WIFI_BUF_OFFSET;
+	request->wldp_result = WL_SUCCESS;
+	mp->b_cont->b_wptr = mp->b_cont->b_rptr + WIFI_BUF_OFFSET;
+	miocack(queue, mp, WIFI_BUF_OFFSET, 0);
+}
+
+static mac_callbacks_t iwm_m_callbacks = {
+	.mc_callbacks = MC_IOCTL | MC_GETPROP | MC_PROPINFO,
+	.mc_getstat = iwm_m_stat,
+	.mc_start = iwm_m_start,
+	.mc_stop = iwm_m_stop,
+	.mc_setpromisc = iwm_m_promisc,
+	.mc_multicst = iwm_m_multicst,
+	.mc_unicst = iwm_m_unicst,
+	.mc_tx = iwm_m_tx,
+	.mc_ioctl = iwm_m_ioctl,
+	.mc_getprop = iwm_m_getprop,
+	.mc_propinfo = iwm_m_propinfo
+};
+
+static int
+iwm_public_register(struct iwm_softc *sc)
+{
+	mac_register_t *registration;
+	char name[32];
+	int error, instance = ddi_get_instance(sc->dip);
+
+	if ((error = iwm_preinit(sc)) != 0 ||
+	    (error = iwm_scan_attach(sc)) != 0)
+		return (error);
+	sc->wifi.wd_opmode = IEEE80211_M_STA;
+	sc->wifi.wd_secalloc = WIFI_SEC_NONE;
+	bcopy(sc->identity.mac, sc->wifi.wd_bssid, IEEE80211_ADDR_LEN);
+	registration = mac_alloc(MAC_VERSION);
+	if (registration == NULL)
+		return (ENOMEM);
+	registration->m_type_ident = MAC_PLUGIN_IDENT_WIFI;
+	registration->m_driver = sc;
+	registration->m_dip = sc->dip;
+	registration->m_src_addr = sc->identity.mac;
+	registration->m_callbacks = &iwm_m_callbacks;
+	registration->m_min_sdu = 0;
+	registration->m_max_sdu = IEEE80211_MTU;
+	registration->m_pdata = &sc->wifi;
+	registration->m_pdata_size = sizeof (sc->wifi);
+	error = mac_register(registration, &sc->ic.ic_mach);
+	mac_free(registration);
+	if (error != 0)
+		return (error);
+	sc->mac_registered = B_TRUE;
+	mac_link_update(sc->ic.ic_mach, LINK_STATE_DOWN);
+	(void) snprintf(name, sizeof (name), "iwm%d", instance);
+	if (ddi_create_minor_node(sc->dip, name, S_IFCHR, instance + 1,
+	    DDI_NT_NET_WIFI, 0) != DDI_SUCCESS)
+		return (EIO);
+	sc->minor_created = B_TRUE;
+	return (0);
+}
+
+/* Framework calls are made with neither driver mutex held. */
+static int
+iwm_public_unregister(struct iwm_softc *sc)
+{
+	int error;
+
+	mutex_enter(&sc->operation_lock);
+	sc->detach_requested = B_TRUE;
+	mutex_exit(&sc->operation_lock);
+	if (sc->mac_registered && (error = mac_disable(sc->ic.ic_mach)) != 0) {
+		mutex_enter(&sc->operation_lock);
+		sc->detach_requested = B_FALSE;
+		mutex_exit(&sc->operation_lock);
+		return (error);
+	}
+	iwm_m_stop(sc);
+	if ((error = iwm_operation_enter(sc, IWM_OP_DETACH)) != 0)
+		return (error);
+	if (sc->run != NULL || sc->runtime_stop_error != 0) {
+		error = EIO;
+		goto out;
+	}
+	if (sc->minor_created) {
+		ddi_remove_minor_node(sc->dip, NULL);
+		sc->minor_created = B_FALSE;
+	}
+	if (sc->mac_registered) {
+		if ((error = mac_unregister(sc->ic.ic_mach)) != 0)
+			goto out;
+		sc->mac_registered = B_FALSE;
+		sc->ic.ic_mach = NULL;
+	}
+	error = iwm_scan_detach(sc);
+out:
+	iwm_operation_exit(sc);
+	return (error);
 }
 
 static int
@@ -603,7 +1098,6 @@ iwm_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 {
 	struct iwm_softc *sc;
 	int instance = ddi_get_instance(dip);
-	int i;
 	uint16_t command;
 
 	if (cmd != DDI_ATTACH)
@@ -612,6 +1106,11 @@ iwm_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 		return (DDI_FAILURE);
 	sc = ddi_get_soft_state(iwm_state, instance);
 	sc->dip = dip;
+	mutex_init(&sc->operation_lock, NULL, MUTEX_DRIVER, NULL);
+	cv_init(&sc->operation_cv, NULL, CV_DRIVER, NULL);
+	sc->operation_initialized = B_TRUE;
+	sc->public_enabled = ddi_prop_get_int(DDI_DEV_T_ANY, dip,
+	    DDI_PROP_DONTPASS, "iwm-public-scan", 0) != 0;
 	ddi_set_driver_private(dip, sc);
 	sc->fail_step = ddi_prop_get_int(DDI_DEV_T_ANY, dip,
 	    DDI_PROP_DONTPASS, "iwm-attach-fail", 0);
@@ -620,27 +1119,23 @@ iwm_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	    iwm_pci_map(sc) != 0 || iwm_passive_csr(sc) != 0 ||
 	    iwm_intr_open(sc) != 0)
 		goto fail;
-	for (i = 0; i < IWM_PASSIVE_DMA_COUNT; i++) {
-		if (iwm_dma_alloc(sc, &sc->dma[i], iwm_passive_dma[i].size,
-		    iwm_passive_dma[i].align, DDI_DMA_RDWR) != 0)
-			goto fail;
-		dev_err(dip, CE_NOTE, "!iwm DMA %s size=%lu align=%u "
-		    "cookies=1 address-width<=36 unpublished",
-		    iwm_passive_dma[i].name, (ulong_t)sc->dma[i].size,
-		    iwm_passive_dma[i].align);
-	}
+	if (iwm_base_dma_alloc(sc) != 0)
+		goto fail;
 	if (iwm_intr_test(sc) != 0)
 		goto fail;
 	command = pci_config_get16(sc->pcih, PCI_CONF_COMM);
 	if ((command ^ sc->pci_command) & PCI_COMM_ME)
 		goto fail;
-	if (ddi_prop_get_int(DDI_DEV_T_ANY, dip, DDI_PROP_DONTPASS,
+	if (sc->public_enabled) {
+		if (iwm_public_register(sc) != 0)
+			goto fail;
+	} else if (ddi_prop_get_int(DDI_DEV_T_ANY, dip, DDI_PROP_DONTPASS,
 	    "iwm-init-nvm", 0) != 0 && iwm_init_nvm(sc) != 0)
 		goto fail;
 	sc->attached = B_TRUE;
 	dev_err(dip, CE_NOTE, "!iwm attach complete, %d checkpoints; "
-	    "PCI command=%04x; no MAC",
-	    sc->attach_step, command);
+	    "PCI command=%04x; public=%u",
+	    sc->attach_step, command, sc->mac_registered);
 	return (DDI_SUCCESS);
 
 fail:
