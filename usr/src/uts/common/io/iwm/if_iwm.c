@@ -663,7 +663,7 @@ iwm_operation_enter(struct iwm_softc *sc, enum iwm_operation operation)
 			sc->operation = operation;
 			break;
 		}
-		if (operation == IWM_OP_SCAN) {
+		if (operation == IWM_OP_SCAN || operation == IWM_OP_SELECT) {
 			error = EBUSY;
 			break;
 		}
@@ -689,6 +689,74 @@ iwm_operation_exit(struct iwm_softc *sc)
 	mutex_exit(&sc->operation_lock);
 }
 
+/*
+ * The caller owns a public operation, but holds neither driver mutex. Owner
+ * bits represent lifetime claims, not MAC framework or association state.
+ * Publish a new claim only after startup succeeds. A failed final stop leaves
+ * the claim and runtime intact for diagnosis; it cannot permit a new startup.
+ */
+static int
+iwm_runtime_acquire(struct iwm_softc *sc, enum iwm_runtime_owner owner)
+{
+	int error;
+
+	ASSERT(sc->operation != IWM_OP_NONE);
+	ASSERT(owner == IWM_RUNTIME_PROVIDER || owner == IWM_RUNTIME_CONNECT);
+	if (sc->detach_requested || !sc->mac_registered || !sc->net_attached ||
+	    !sc->identity.valid || !sc->minor_created)
+		return (ENXIO);
+	if (sc->runtime_stop_error != 0)
+		return (sc->runtime_stop_error);
+	if (sc->runtime_owners & owner)
+		return (0);
+	if (sc->runtime_started) {
+		ASSERT(sc->runtime_owners != 0 && sc->run != NULL);
+		sc->runtime_owners |= owner;
+		return (0);
+	}
+	ASSERT(sc->runtime_owners == 0);
+	error = iwm_runtime_start(sc);
+	if (error != 0)
+		return (error);
+	sc->runtime_started = B_TRUE;
+	if (iwm_checkpoint(sc, "runtime-started") != 0) {
+		sc->runtime_stop_error = iwm_runtime_stop(sc);
+		if (sc->runtime_stop_error == 0)
+			sc->runtime_started = B_FALSE;
+		else
+			dev_err(sc->dip, CE_WARN,
+			    "!iwm start rollback error=%d",
+			    sc->runtime_stop_error);
+		return (EIO);
+	}
+	sc->runtime_owners |= owner;
+	return (0);
+}
+
+static int
+iwm_runtime_release(struct iwm_softc *sc, enum iwm_runtime_owner owner)
+{
+	int error;
+
+	ASSERT(sc->operation != IWM_OP_NONE);
+	ASSERT(owner == IWM_RUNTIME_PROVIDER || owner == IWM_RUNTIME_CONNECT);
+	if (sc->runtime_stop_error != 0)
+		return (sc->runtime_stop_error);
+	if (!(sc->runtime_owners & owner))
+		return (0);
+	if (sc->runtime_owners & ~owner) {
+		sc->runtime_owners &= ~owner;
+		return (0);
+	}
+	error = iwm_runtime_stop(sc);
+	sc->runtime_stop_error = error;
+	if (error == 0) {
+		sc->runtime_started = B_FALSE;
+		sc->runtime_owners &= ~owner;
+	}
+	return (error);
+}
+
 static int
 iwm_m_start(void *arg)
 {
@@ -697,28 +765,7 @@ iwm_m_start(void *arg)
 
 	if ((error = iwm_operation_enter(sc, IWM_OP_START)) != 0)
 		return (error);
-	if (!sc->mac_registered || !sc->net_attached ||
-	    !sc->identity.valid || !sc->minor_created)
-		error = ENXIO;
-	else if (sc->runtime_started)
-		error = 0;
-	else if (sc->runtime_stop_error != 0)
-		error = sc->runtime_stop_error;
-	else {
-		error = iwm_runtime_start(sc);
-		if (error == 0) {
-			sc->runtime_started = B_TRUE;
-			if (iwm_checkpoint(sc, "runtime-started") != 0) {
-				error = EIO;
-				sc->runtime_started = B_FALSE;
-				sc->runtime_stop_error = iwm_runtime_stop(sc);
-				if (sc->runtime_stop_error != 0)
-					dev_err(sc->dip, CE_WARN,
-					    "!iwm start rollback error=%d",
-					    sc->runtime_stop_error);
-			}
-		}
-	}
+	error = iwm_runtime_acquire(sc, IWM_RUNTIME_PROVIDER);
 	iwm_operation_exit(sc);
 	return (error);
 }
@@ -735,11 +782,8 @@ iwm_m_stop(void *arg)
 		    error);
 		return;
 	}
-	error = iwm_runtime_stop(sc);
-	sc->runtime_stop_error = error;
-	if (error == 0)
-		sc->runtime_started = B_FALSE;
-	else
+	error = iwm_runtime_release(sc, IWM_RUNTIME_PROVIDER);
+	if (error != 0)
 		dev_err(sc->dip, CE_WARN, "!iwm runtime stop error=%d", error);
 	iwm_operation_exit(sc);
 }
@@ -892,6 +936,40 @@ iwm_ess_node(void *arg, struct ieee80211_node *node)
 }
 
 static int
+iwm_m_setprop(void *arg, const char *name, mac_prop_id_t id,
+    uint_t size, const void *value)
+{
+	struct iwm_softc *sc = arg;
+	const uint8_t *address = value;
+	uint8_t nonzero = 0;
+	uint_t i;
+	int error;
+
+	_NOTE(ARGUNUSED(name))
+	if (id != MAC_PROP_WL_BSSID)
+		return (ENOTSUP);
+	if (size != sizeof (wl_bssid_t) || value == NULL)
+		return (EINVAL);
+	for (i = 0; i < IEEE80211_ADDR_LEN; i++)
+		nonzero |= address[i];
+	if (nonzero == 0 || (address[0] & 1) != 0)
+		return (EINVAL);
+	if ((error = iwm_operation_enter(sc, IWM_OP_SELECT)) != 0)
+		return (error);
+	if (!sc->net_attached || !sc->mac_registered)
+		error = ENXIO;
+	else if (sc->associated_bssid_valid ||
+	    (sc->runtime_owners & IWM_RUNTIME_CONNECT) != 0)
+		error = EBUSY;
+	else {
+		bcopy(address, sc->desired_bssid, IEEE80211_ADDR_LEN);
+		sc->desired_bssid_valid = B_TRUE;
+	}
+	iwm_operation_exit(sc);
+	return (error);
+}
+
+static int
 iwm_m_getprop(void *arg, const char *name, mac_prop_id_t id,
     uint_t size, void *value)
 {
@@ -902,6 +980,18 @@ iwm_m_getprop(void *arg, const char *name, mac_prop_id_t id,
 	int error;
 
 	_NOTE(ARGUNUSED(name))
+	if (id == MAC_PROP_WL_BSSID) {
+		if (size < sizeof (wl_bssid_t))
+			return (ENOSPC);
+		if ((error = iwm_operation_enter(sc, IWM_OP_READ)) != 0)
+			return (error);
+		if (sc->associated_bssid_valid)
+			bcopy(sc->associated_bssid, value, sizeof (wl_bssid_t));
+		else
+			bzero(value, sizeof (wl_bssid_t));
+		iwm_operation_exit(sc);
+		return (0);
+	}
 	if (id == MAC_PROP_WL_LINKSTATUS) {
 		if (size < sizeof (wl_linkstatus_t))
 			return (ENOSPC);
@@ -948,6 +1038,10 @@ iwm_m_propinfo(void *arg, const char *name, mac_prop_id_t id,
     mac_prop_info_handle_t handle)
 {
 	_NOTE(ARGUNUSED(arg, name))
+	if (id == MAC_PROP_WL_BSSID) {
+		mac_prop_info_set_perm(handle, MAC_PROP_PERM_RW);
+		return;
+	}
 	mac_prop_info_set_perm(handle,
 	    id == MAC_PROP_WL_LINKSTATUS || id == MAC_PROP_WL_ESS_LIST ?
 	    MAC_PROP_PERM_READ : 0);
@@ -1015,7 +1109,7 @@ iwm_m_ioctl(void *arg, queue_t *queue, mblk_t *mp)
 }
 
 static mac_callbacks_t iwm_m_callbacks = {
-	.mc_callbacks = MC_IOCTL | MC_GETPROP | MC_PROPINFO,
+	.mc_callbacks = MC_IOCTL | MC_GETPROP | MC_PROPINFO | MC_SETPROP,
 	.mc_getstat = iwm_m_stat,
 	.mc_start = iwm_m_start,
 	.mc_stop = iwm_m_stop,
@@ -1025,6 +1119,7 @@ static mac_callbacks_t iwm_m_callbacks = {
 	.mc_tx = iwm_m_tx,
 	.mc_ioctl = iwm_m_ioctl,
 	.mc_getprop = iwm_m_getprop,
+	.mc_setprop = iwm_m_setprop,
 	.mc_propinfo = iwm_m_propinfo
 };
 
@@ -1221,6 +1316,10 @@ _init(void)
 	if (error != 0)
 		return (error);
 	mac_init_ops(&iwm_devops, "iwm");
+	if (iwm_devops.devo_cb_ops->cb_str == NULL) {
+		ddi_soft_state_fini(&iwm_state);
+		return (ENXIO);
+	}
 	error = mod_install(&iwm_modlinkage);
 	if (error != 0) {
 		mac_fini_ops(&iwm_devops);

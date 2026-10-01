@@ -152,6 +152,35 @@
 #define	IWM_PHY_DB_CALIB_CHG_TXP	5
 #define	IWM_PAGING_BLOCK_SIZE	32768
 #define	IWM_PAGING_BLOCKS	33
+#define	IWM_MCC_UPDATE_CMD	0xc8
+#define	IWM_MCC_CHUB_UPDATE_CMD	0xc9
+#define	IWM_MCC_COMMAND_SIZE	28
+#define	IWM_MCC_HEADER_SIZE	16
+#define	IWM_MCC_CHANNELS	51
+#define	IWM_MCC_SOURCE_GET_CURRENT	0x10
+#define	IWM_MCC_NEW_PROFILE	0
+#define	IWM_MCC_SAME_PROFILE	1
+#define	IWM_LAR_VALID	0x01
+#define	IWM_LAR_ACTIVE	0x08
+#define	IWM_LAR_RESTRICTED	0x90	/* RADAR or DFS */
+
+/* Current-profile state belongs to one REGULAR firmware generation. */
+struct iwm_lar_state {
+	boolean_t attempted;
+	boolean_t ready;
+	boolean_t changed;
+	int error;
+	uint32_t status;
+	uint32_t count;
+	uint16_t mcc;
+	uint16_t time;
+	uint16_t geo;
+	uint8_t cap;
+	uint8_t source;
+	uint16_t changed_mcc;
+	uint8_t changed_source;
+	uint32_t channels[IWM_MCC_CHANNELS];
+};
 
 enum iwm_fw_state {
 	IWM_FW_CLOSED, IWM_FW_LOADED, IWM_FW_PARSED, IWM_CARD_PREPARED,
@@ -315,6 +344,7 @@ struct iwm_scan_state {
 
 struct iwm_runtime {
 	struct iwm_scan_state scan;
+	struct iwm_lar_state lar;
 	struct iwm_proto_diag diagnostic;
 	struct iwm_proto_diag first_error;
 	struct iwm_proto_diag response_diagnostic;
@@ -970,6 +1000,83 @@ iwm_u32(const uint8_t *p)
 	    (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24);
 }
 
+/* No host country selection: the donor requests the current NVM/FW profile. */
+static void
+iwm_lar_command(uint8_t command[IWM_MCC_COMMAND_SIZE])
+{
+	bzero(command, IWM_MCC_COMMAND_SIZE);
+	command[0] = command[1] = 'Z';
+	command[2] = IWM_MCC_SOURCE_GET_CURRENT;
+}
+
+/* Decode API36 v3 only, after enclosing command ownership validation. */
+static int
+iwm_lar_parse(struct iwm_lar_state *lar, const uint8_t *p, size_t n)
+{
+	uint_t i;
+
+	lar->ready = B_FALSE;
+	if (n < IWM_MCC_HEADER_SIZE)
+		return (EPROTO);
+	lar->status = iwm_u32(p);
+	lar->mcc = iwm_u16(p + 4);
+	lar->cap = p[6];
+	lar->source = p[7];
+	lar->time = iwm_u16(p + 8);
+	lar->geo = iwm_u16(p + 10);
+	lar->count = iwm_u32(p + 12);
+	if (lar->count > IWM_MCC_CHANNELS ||
+	    lar->count > (n - IWM_MCC_HEADER_SIZE) / 4 ||
+	    n != IWM_MCC_HEADER_SIZE + 4 * lar->count)
+		return (EPROTO);
+	if (lar->status != IWM_MCC_NEW_PROFILE &&
+	    lar->status != IWM_MCC_SAME_PROFILE)
+		return (EIO);
+	if (lar->count == 0 || lar->changed)
+		return (EACCES);
+	for (i = 0; i < lar->count; i++)
+		lar->channels[i] = iwm_u32(p + IWM_MCC_HEADER_SIZE + 4 * i);
+	lar->ready = B_TRUE;
+	return (0);
+}
+
+/*
+ * Deliberately narrower than a general station regulatory policy. ACTIVE is
+ * active-scan permission, not a universal station-TX bit; require it in both
+ * maps for the initial controlled-BSS experiment without enabling probes.
+ */
+static int
+iwm_lar_channel(const struct iwm_lar_state *lar, const uint16_t *nvm,
+    uint_t channel)
+{
+	uint32_t flags, required = IWM_LAR_VALID | IWM_LAR_ACTIVE;
+
+	if (!lar->ready || lar->changed || channel == 0 || channel > 13 ||
+	    channel > lar->count)
+		return (EACCES);
+	flags = lar->channels[channel - 1];
+	if ((flags & required) != required ||
+	    (nvm[channel - 1] & required) != required ||
+	    ((flags | nvm[channel - 1]) & IWM_LAR_RESTRICTED) != 0)
+		return (EACCES);
+	return (0);
+}
+
+static int
+iwm_lar_changed(struct iwm_lar_state *lar, const uint8_t *p, size_t n,
+    boolean_t regular)
+{
+	lar->ready = B_FALSE;
+	lar->changed = B_TRUE;
+	lar->error = EPROTO;
+	if (regular && n == 4) {
+		lar->changed_mcc = iwm_u16(p);
+		lar->changed_source = p[2];
+		lar->error = EIO;
+	}
+	return (lar->error);
+}
+
 /* Validate the complete fixed PHY DB header before using its group index. */
 static int
 iwm_phy_index(const uint8_t *data, size_t length, uint_t *slot,
@@ -1426,6 +1533,16 @@ iwm_notification(struct iwm_softc *sc, const uint8_t *p, size_t length)
 	d->pending = r->command_pending;
 	d->payload = n;
 
+	if (code == IWM_MCC_CHUB_UPDATE_CMD && r->lar.attempted) {
+		/* Close admission; the thread owner performs bounded stop. */
+		(void) iwm_lar_changed(&r->lar, data, n,
+		    r->image == IWM_FW_REGULAR &&
+		    r->state == IWM_REGULAR_IDLE);
+		if (r->error == 0)
+			r->error = r->lar.error;
+		cv_broadcast(&r->cv);
+		return;
+	}
 	if (r->scan.enabled && (code == 0xc0 || code == 0xc1)) {
 		iwm_scan_rx(sc, code, data, n);
 		return;
@@ -1708,6 +1825,65 @@ iwm_control(struct iwm_softc *sc, uint_t code, const void *data, size_t size)
 		r->cmdcur = (r->cmdcur + 1) % IWM_TX_RING_COUNT;
 		r->control_command = B_FALSE;
 	}
+	return (error);
+}
+
+/*
+ * Caller owns the public connection operation, keeping runtime alive. This
+ * does not start firmware and is never called by the passive scan path.
+ */
+int
+iwm_lar_prepare(struct iwm_softc *sc, uint_t channel)
+{
+	struct iwm_runtime *r;
+	uint8_t command[IWM_MCC_COMMAND_SIZE];
+	int error;
+
+	mutex_enter(&sc->lock);
+	r = sc->run;
+	if (r == NULL || !sc->identity.valid ||
+	    r->image != IWM_FW_REGULAR || r->state != IWM_REGULAR_IDLE ||
+	    r->cancel_requested || r->error != 0) {
+		error = ENXIO;
+		goto out;
+	}
+	/* Require the audited LAR, multi-MCC and v3 capability set. */
+	if ((sc->identity.lar & 7) == 0 ||
+	    (sc->fw.capa[0] & ((1U << 1) | (1U << 29))) !=
+	    ((1U << 1) | (1U << 29)) ||
+	    (sc->fw.capa[2] & (1U << 9)) == 0) {
+		error = ENOTSUP;
+		goto out;
+	}
+	if (channel == 0 || channel > 13) {
+		error = EINVAL;
+		goto out;
+	}
+	if (!r->lar.attempted) {
+		r->lar.attempted = B_TRUE;
+		iwm_lar_command(command);
+		error = iwm_nic_lock(sc);
+		if (error == 0) {
+			error = iwm_control(sc, IWM_MCC_UPDATE_CMD, command,
+			    sizeof (command));
+			iwm_nic_unlock(sc);
+		}
+		if (error == 0)
+			error = iwm_lar_parse(&r->lar, r->response,
+			    r->response_len);
+		r->lar.error = error;
+		if (error != 0)
+			dev_err(sc->dip, CE_WARN, "!iwm LAR error=%d "
+			    "status=%u mcc=%04x source=%u count=%u",
+			    error, r->lar.status, r->lar.mcc,
+			    r->lar.source, r->lar.count);
+	}
+	error = r->lar.error;
+	if (error == 0)
+		error = iwm_lar_channel(&r->lar, sc->identity.channels,
+		    channel);
+out:
+	mutex_exit(&sc->lock);
 	return (error);
 }
 
@@ -2286,6 +2462,7 @@ iwm_device_stop(struct iwm_softc *sc, boolean_t final)
 	uint32_t mask;
 	int error = 0;
 
+	r->lar.ready = B_FALSE;
 	if (r->stop_failed)
 		return (EIO);
 	if (!r->touched || r->stopped) {

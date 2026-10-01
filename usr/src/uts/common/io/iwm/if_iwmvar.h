@@ -209,7 +209,13 @@ struct iwm_identity {
 
 enum iwm_operation {
 	IWM_OP_NONE, IWM_OP_START, IWM_OP_SCAN, IWM_OP_STOP,
-	IWM_OP_DETACH, IWM_OP_READ
+	IWM_OP_DETACH, IWM_OP_READ, IWM_OP_CONNECT, IWM_OP_DISCONNECT,
+	IWM_OP_SELECT
+};
+
+enum iwm_runtime_owner {
+	IWM_RUNTIME_PROVIDER = 0x01,
+	IWM_RUNTIME_CONNECT = 0x02
 };
 
 struct iwm_softc {
@@ -227,6 +233,11 @@ struct iwm_softc {
 	boolean_t		mac_registered;
 	boolean_t		minor_created;
 	boolean_t		runtime_started;
+	uint_t			runtime_owners;
+	boolean_t		desired_bssid_valid;
+	boolean_t		associated_bssid_valid;
+	uint8_t			desired_bssid[IEEE80211_ADDR_LEN];
+	uint8_t			associated_bssid[IEEE80211_ADDR_LEN];
 	boolean_t		stop_requested;
 	boolean_t		detach_requested;
 	uint_t			generation;
@@ -289,6 +300,7 @@ int iwm_preinit(struct iwm_softc *);
 int iwm_runtime_start(struct iwm_softc *);
 int iwm_runtime_stop(struct iwm_softc *);
 int iwm_public_scan(struct iwm_softc *);
+int iwm_lar_prepare(struct iwm_softc *, uint_t);
 void iwm_scan_stop_request(struct iwm_softc *);
 int iwm_scan_attach(struct iwm_softc *);
 int iwm_scan_detach(struct iwm_softc *);
