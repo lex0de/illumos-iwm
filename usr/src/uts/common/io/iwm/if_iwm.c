@@ -706,8 +706,18 @@ iwm_m_start(void *arg)
 		error = sc->runtime_stop_error;
 	else {
 		error = iwm_runtime_start(sc);
-		if (error == 0)
+		if (error == 0) {
 			sc->runtime_started = B_TRUE;
+			if (iwm_checkpoint(sc, "runtime-started") != 0) {
+				error = EIO;
+				sc->runtime_started = B_FALSE;
+				sc->runtime_stop_error = iwm_runtime_stop(sc);
+				if (sc->runtime_stop_error != 0)
+					dev_err(sc->dip, CE_WARN,
+					    "!iwm start rollback error=%d",
+					    sc->runtime_stop_error);
+			}
+		}
 	}
 	iwm_operation_exit(sc);
 	return (error);
@@ -924,6 +934,8 @@ iwm_m_getprop(void *arg, const char *name, mac_prop_id_t id,
 	    snapshot.list->wl_ess_list_num * sizeof (wl_ess_conf_t);
 	if (error == 0 && used > size)
 		error = ENOSPC;
+	if (error == 0 && iwm_checkpoint(sc, "esslist-snapshot") != 0)
+		error = EIO;
 	if (error == 0)
 		bcopy(snapshot.list, value, used);
 	kmem_free(snapshot.list, snapshot.size);
@@ -1047,6 +1059,8 @@ iwm_public_register(struct iwm_softc *sc)
 		return (error);
 	sc->mac_registered = B_TRUE;
 	mac_link_update(sc->ic.ic_mach, LINK_STATE_DOWN);
+	if (iwm_checkpoint(sc, "public-mac-registered") != 0)
+		return (EIO);
 	(void) snprintf(name, sizeof (name), "iwm%d", instance);
 	if (ddi_create_minor_node(sc->dip, name, S_IFCHR, instance + 1,
 	    DDI_NT_NET_WIFI, 0) != DDI_SUCCESS)

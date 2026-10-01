@@ -2849,7 +2849,9 @@ iwm_preinit(struct iwm_softc *sc)
 		sc->identity.valid = B_FALSE;
 		return (error != 0 ? error : cleanup);
 	}
-	return (sc->identity.valid ? 0 : EINVAL);
+	if (!sc->identity.valid)
+		return (EINVAL);
+	return (iwm_checkpoint(sc, "preinit-persistent"));
 }
 
 int
