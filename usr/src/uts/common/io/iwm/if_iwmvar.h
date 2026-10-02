@@ -124,6 +124,7 @@
 #include <sys/sunddi.h>
 #include <sys/net80211.h>
 #include <sys/mac_wifi.h>
+#include <sys/taskq.h>
 #include <io/iwm/if_iwmreg.h>
 #include <io/iwm/if_iwmfw.h>
 
@@ -155,6 +156,11 @@ struct iwm_tx_data {
 	struct iwm_dma_info	dma;
 	mblk_t			*mp;
 	struct ieee80211_node	*ni;
+	boolean_t		owned;
+	boolean_t		completed;
+	uint_t			generation;
+	clock_t			expires;
+	uint32_t		status;
 };
 
 struct iwm_tx_ring {
@@ -218,11 +224,34 @@ enum iwm_runtime_owner {
 	IWM_RUNTIME_CONNECT = 0x02
 };
 
+/* Persistent worker/selector state; transport belongs to the runtime. */
+struct iwm_connection {
+	taskq_t *taskq;
+	kcondvar_t cv;
+	kthread_t *thread;
+	ieee80211_node_t *node;
+	boolean_t pending;
+	boolean_t finished;
+	boolean_t cancel;
+	boolean_t running;
+	boolean_t link_up;
+	boolean_t tx_admission;
+	boolean_t rx_admission;
+	uint8_t essid[IEEE80211_NWID_LEN];
+	uint_t esslen;
+	uint_t channel;
+	uint_t parameters;
+	int error;
+	int cleanup_error;
+	int (*newstate)(ieee80211com_t *, enum ieee80211_state, int);
+};
+
 struct iwm_softc {
 	dev_info_t		*dip;
 	const struct iwm_cfg	*cfg;
 	ieee80211com_t		ic;
 	struct iwm_identity	identity;
+	struct iwm_connection	connection;
 	wifi_data_t		wifi;
 	kmutex_t		operation_lock;
 	kcondvar_t		operation_cv;
@@ -298,8 +327,19 @@ int iwm_init_nvm(struct iwm_softc *);
 int iwm_base_dma_alloc(struct iwm_softc *);
 int iwm_preinit(struct iwm_softc *);
 int iwm_runtime_start(struct iwm_softc *);
+int iwm_runtime_status(struct iwm_softc *);
+int iwm_operation_enter(struct iwm_softc *, enum iwm_operation);
+void iwm_operation_exit(struct iwm_softc *);
+int iwm_runtime_acquire(struct iwm_softc *, enum iwm_runtime_owner);
+int iwm_runtime_release(struct iwm_softc *, enum iwm_runtime_owner);
+void iwm_connection_task(void *);
+void iwm_connection_cancel(struct iwm_softc *);
+int iwm_connection_disconnect(struct iwm_softc *);
+mblk_t *iwm_connection_tx(struct iwm_softc *, mblk_t *);
 int iwm_runtime_stop(struct iwm_softc *);
 int iwm_public_scan(struct iwm_softc *);
+int iwm_select_bss(struct iwm_softc *, const uint8_t *, size_t, uint_t,
+    ieee80211_node_t **);
 int iwm_lar_prepare(struct iwm_softc *, uint_t);
 void iwm_scan_stop_request(struct iwm_softc *);
 int iwm_scan_attach(struct iwm_softc *);

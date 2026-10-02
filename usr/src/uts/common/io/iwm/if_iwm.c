@@ -42,6 +42,7 @@
 #include <sys/strsun.h>
 #include <sys/policy.h>
 #include <sys/stat.h>
+#include <sys/disp.h>
 #include <inet/wifi_ioctl.h>
 #include "if_iwmvar.h"
 
@@ -624,6 +625,7 @@ iwm_cleanup(struct iwm_softc *sc)
 	iwm_pci_unmap(sc);
 	sc->csr_valid = B_FALSE;
 	if (sc->operation_initialized) {
+		cv_destroy(&sc->connection.cv);
 		cv_destroy(&sc->operation_cv);
 		mutex_destroy(&sc->operation_lock);
 		sc->operation_initialized = B_FALSE;
@@ -636,7 +638,7 @@ iwm_cleanup(struct iwm_softc *sc)
  * drop operation_lock before hardware or framework calls. STOP signals the
  * scan owner under lock, then waits; it never runs a second scan drain.
  */
-static int
+int
 iwm_operation_enter(struct iwm_softc *sc, enum iwm_operation operation)
 {
 	clock_t end = ddi_get_lbolt() + drv_usectohz(30000000);
@@ -650,20 +652,23 @@ iwm_operation_enter(struct iwm_softc *sc, enum iwm_operation operation)
 	}
 	for (;;) {
 		if (sc->detach_requested && operation != IWM_OP_STOP &&
-		    operation != IWM_OP_DETACH) {
+		    operation != IWM_OP_DETACH &&
+		    operation != IWM_OP_DISCONNECT) {
 			error = ENXIO;
 			break;
 		}
 		if (sc->operation == IWM_OP_NONE) {
 			if (sc->stop_requested && operation != IWM_OP_STOP &&
-			    operation != IWM_OP_DETACH) {
+			    operation != IWM_OP_DETACH &&
+			    operation != IWM_OP_DISCONNECT) {
 				error = EBUSY;
 				break;
 			}
 			sc->operation = operation;
 			break;
 		}
-		if (operation == IWM_OP_SCAN || operation == IWM_OP_SELECT) {
+		if (operation == IWM_OP_SCAN || operation == IWM_OP_SELECT ||
+		    operation == IWM_OP_CONNECT) {
 			error = EBUSY;
 			break;
 		}
@@ -677,7 +682,7 @@ iwm_operation_enter(struct iwm_softc *sc, enum iwm_operation operation)
 	return (error);
 }
 
-static void
+void
 iwm_operation_exit(struct iwm_softc *sc)
 {
 	mutex_enter(&sc->operation_lock);
@@ -695,7 +700,7 @@ iwm_operation_exit(struct iwm_softc *sc)
  * Publish a new claim only after startup succeeds. A failed final stop leaves
  * the claim and runtime intact for diagnosis; it cannot permit a new startup.
  */
-static int
+int
 iwm_runtime_acquire(struct iwm_softc *sc, enum iwm_runtime_owner owner)
 {
 	int error;
@@ -707,6 +712,8 @@ iwm_runtime_acquire(struct iwm_softc *sc, enum iwm_runtime_owner owner)
 		return (ENXIO);
 	if (sc->runtime_stop_error != 0)
 		return (sc->runtime_stop_error);
+	if (sc->runtime_started && (error = iwm_runtime_status(sc)) != 0)
+		return (error);
 	if (sc->runtime_owners & owner)
 		return (0);
 	if (sc->runtime_started) {
@@ -733,7 +740,7 @@ iwm_runtime_acquire(struct iwm_softc *sc, enum iwm_runtime_owner owner)
 	return (0);
 }
 
-static int
+int
 iwm_runtime_release(struct iwm_softc *sc, enum iwm_runtime_owner owner)
 {
 	int error;
@@ -792,16 +799,8 @@ static mblk_t *
 iwm_m_tx(void *arg, mblk_t *mp)
 {
 	struct iwm_softc *sc = arg;
-	mblk_t *next;
 
-	atomic_inc_32(&sc->tx_rejected);
-	while (mp != NULL) {
-		next = mp->b_next;
-		mp->b_next = NULL;
-		freemsg(mp);
-		mp = next;
-	}
-	return (NULL);
+	return (iwm_connection_tx(sc, mp));
 }
 
 static int
@@ -944,8 +943,88 @@ iwm_m_setprop(void *arg, const char *name, mac_prop_id_t id,
 	uint8_t nonzero = 0;
 	uint_t i;
 	int error;
+	struct iwm_connection *c = &sc->connection;
+	const wl_essid_t *essid = value;
+	const wl_phy_conf_t *phy = value;
+	uint32_t scalar;
 
 	_NOTE(ARGUNUSED(name))
+	if (value == NULL)
+		return (EINVAL);
+	if (id == MAC_PROP_WL_ESSID) {
+		if (size != sizeof (*essid) || essid->wl_essid_length == 0 ||
+		    essid->wl_essid_length > IEEE80211_NWID_LEN)
+			return (EINVAL);
+		if ((error = iwm_operation_enter(sc, IWM_OP_CONNECT)) != 0)
+			return (error);
+		mutex_enter(&sc->lock);
+		if (c->pending || !sc->desired_bssid_valid ||
+		    c->parameters != 7 || c->taskq == NULL ||
+		    sc->ic.ic_state != IEEE80211_S_INIT) {
+			error = EBUSY;
+		} else {
+			bcopy(essid->wl_essid_essid, c->essid,
+			    essid->wl_essid_length);
+			c->esslen = essid->wl_essid_length;
+			c->error = c->cleanup_error = 0;
+			c->cancel = B_FALSE;
+			c->finished = B_FALSE;
+			c->pending = B_TRUE;
+			/* Worker inherits the token, never this mutex. */
+			if (taskq_dispatch(c->taskq, iwm_connection_task, sc,
+			    TQ_NOSLEEP) == TASKQID_INVALID) {
+				c->pending = B_FALSE;
+				error = ENOMEM;
+			}
+		}
+		mutex_exit(&sc->lock);
+		if (error != 0)
+			iwm_operation_exit(sc);
+		return (error);
+	}
+	if (id == MAC_PROP_WL_ENCRYPTION || id == MAC_PROP_WL_AUTH_MODE ||
+	    id == MAC_PROP_WL_BSSTYPE || id == MAC_PROP_WL_PHY_CONFIG) {
+		if (id == MAC_PROP_WL_PHY_CONFIG) {
+			size_t offset = offsetof(wl_dsss_t, wl_dsss_channel);
+
+			if (size != sizeof (*phy) ||
+			    phy->wl_phy_dsss_conf.wl_dsss_channel == 0 ||
+			    phy->wl_phy_dsss_conf.wl_dsss_channel > 13)
+				return (EINVAL);
+			/* libdladm leaves non-channel fields unset. */
+			for (i = 0; i < sizeof (*phy); i++) {
+				if (i >= offset &&
+				    i < offset + sizeof (uint32_t))
+					continue;
+				if (address[i] != 0xff)
+					return (ENOTSUP);
+			}
+		} else {
+			if (size != sizeof (scalar))
+				return (EINVAL);
+			bcopy(value, &scalar, sizeof (scalar));
+			if ((id == MAC_PROP_WL_ENCRYPTION &&
+			    scalar != WL_NOENCRYPTION) ||
+			    (id == MAC_PROP_WL_AUTH_MODE &&
+			    scalar != WL_OPENSYSTEM) ||
+			    (id == MAC_PROP_WL_BSSTYPE && scalar != WL_BSS_BSS))
+				return (ENOTSUP);
+		}
+		if ((error = iwm_operation_enter(sc, IWM_OP_SELECT)) != 0)
+			return (error);
+		if (c->pending || !sc->net_attached)
+			error = EBUSY;
+		else if (id == MAC_PROP_WL_PHY_CONFIG)
+			c->channel = phy->wl_phy_dsss_conf.wl_dsss_channel;
+		else if (id == MAC_PROP_WL_ENCRYPTION)
+			c->parameters |= 1;
+		else if (id == MAC_PROP_WL_AUTH_MODE)
+			c->parameters |= 2;
+		else
+			c->parameters |= 4;
+		iwm_operation_exit(sc);
+		return (error);
+	}
 	if (id != MAC_PROP_WL_BSSID)
 		return (ENOTSUP);
 	if (size != sizeof (wl_bssid_t) || value == NULL)
@@ -958,7 +1037,7 @@ iwm_m_setprop(void *arg, const char *name, mac_prop_id_t id,
 		return (error);
 	if (!sc->net_attached || !sc->mac_registered)
 		error = ENXIO;
-	else if (sc->associated_bssid_valid ||
+	else if (c->pending || sc->associated_bssid_valid ||
 	    (sc->runtime_owners & IWM_RUNTIME_CONNECT) != 0)
 		error = EBUSY;
 	else {
@@ -983,19 +1062,36 @@ iwm_m_getprop(void *arg, const char *name, mac_prop_id_t id,
 	if (id == MAC_PROP_WL_BSSID) {
 		if (size < sizeof (wl_bssid_t))
 			return (ENOSPC);
-		if ((error = iwm_operation_enter(sc, IWM_OP_READ)) != 0)
-			return (error);
+		mutex_enter(&sc->lock);
 		if (sc->associated_bssid_valid)
 			bcopy(sc->associated_bssid, value, sizeof (wl_bssid_t));
 		else
 			bzero(value, sizeof (wl_bssid_t));
-		iwm_operation_exit(sc);
+		mutex_exit(&sc->lock);
 		return (0);
 	}
 	if (id == MAC_PROP_WL_LINKSTATUS) {
 		if (size < sizeof (wl_linkstatus_t))
 			return (ENOSPC);
-		*(wl_linkstatus_t *)value = WL_NOTCONNECTED;
+		mutex_enter(&sc->lock);
+		*(wl_linkstatus_t *)value = sc->connection.running ?
+		    WL_CONNECTED : WL_NOTCONNECTED;
+		mutex_exit(&sc->lock);
+		return (0);
+	}
+	if (id == MAC_PROP_WL_ESSID) {
+		wl_essid_t *essid = value;
+
+		if (size < sizeof (*essid))
+			return (ENOSPC);
+		bzero(essid, sizeof (*essid));
+		mutex_enter(&sc->lock);
+		if (sc->connection.running) {
+			essid->wl_essid_length = sc->connection.esslen;
+			bcopy(sc->connection.essid, essid->wl_essid_essid,
+			    sc->connection.esslen);
+		}
+		mutex_exit(&sc->lock);
 		return (0);
 	}
 	if (id != MAC_PROP_WL_ESS_LIST)
@@ -1007,6 +1103,10 @@ iwm_m_getprop(void *arg, const char *name, mac_prop_id_t id,
 	if (!sc->net_attached) {
 		iwm_operation_exit(sc);
 		return (ENXIO);
+	}
+	if (sc->connection.pending) {
+		iwm_operation_exit(sc);
+		return (EBUSY);
 	}
 	snapshot.sc = sc;
 	snapshot.size = MAX_BUF_LEN;
@@ -1038,7 +1138,9 @@ iwm_m_propinfo(void *arg, const char *name, mac_prop_id_t id,
     mac_prop_info_handle_t handle)
 {
 	_NOTE(ARGUNUSED(arg, name))
-	if (id == MAC_PROP_WL_BSSID) {
+	if (id == MAC_PROP_WL_BSSID || id == MAC_PROP_WL_ESSID ||
+	    id == MAC_PROP_WL_ENCRYPTION || id == MAC_PROP_WL_AUTH_MODE ||
+	    id == MAC_PROP_WL_BSSTYPE || id == MAC_PROP_WL_PHY_CONFIG) {
 		mac_prop_info_set_perm(handle, MAC_PROP_PERM_RW);
 		return;
 	}
@@ -1056,7 +1158,9 @@ iwm_scan_ioctl_check(const struct iocblk *ioc, const wldp_t *request,
 	if (chained || size < sizeof (*request) ||
 	    ioc->ioc_count < sizeof (*request) || ioc->ioc_count > size)
 		return (EINVAL);
-	if (request->wldp_type != NET_802_11 || request->wldp_id != WL_SCAN)
+	if (request->wldp_type != NET_802_11 ||
+	    (request->wldp_id != WL_SCAN &&
+	    request->wldp_id != WL_DISASSOCIATE))
 		return (ENOTSUP);
 	if (request->wldp_length < WIFI_BUF_OFFSET ||
 	    request->wldp_length > MAX_BUF_LEN)
@@ -1090,9 +1194,13 @@ iwm_m_ioctl(void *arg, queue_t *queue, mblk_t *mp)
 		miocnak(queue, mp, 0, error);
 		return;
 	}
-	error = iwm_operation_enter(sc, IWM_OP_SCAN);
-	if (error == 0) {
-		if (!sc->runtime_started || !sc->net_attached)
+	if (request->wldp_id == WL_DISASSOCIATE) {
+		/* DLD's ioctl task holds no MAC perimeter across this wait. */
+		error = iwm_connection_disconnect(sc);
+	} else if ((error = iwm_operation_enter(sc, IWM_OP_SCAN)) == 0) {
+		if (sc->connection.pending)
+			error = EBUSY;
+		else if (!sc->runtime_started || !sc->net_attached)
 			error = ENXIO;
 		else
 			error = iwm_public_scan(sc);
@@ -1133,6 +1241,10 @@ iwm_public_register(struct iwm_softc *sc)
 	if ((error = iwm_preinit(sc)) != 0 ||
 	    (error = iwm_scan_attach(sc)) != 0)
 		return (error);
+	sc->connection.taskq = taskq_create("iwm_connection", 1, minclsyspri,
+	    1, 1, TASKQ_PREPOPULATE);
+	if (sc->connection.taskq == NULL)
+		return (ENOMEM);
 	sc->wifi.wd_opmode = IEEE80211_M_STA;
 	sc->wifi.wd_secalloc = WIFI_SEC_NONE;
 	bcopy(sc->identity.mac, sc->wifi.wd_bssid, IEEE80211_ADDR_LEN);
@@ -1179,6 +1291,11 @@ iwm_public_unregister(struct iwm_softc *sc)
 		mutex_exit(&sc->operation_lock);
 		return (error);
 	}
+	if (sc->connection.taskq != NULL &&
+	    (error = iwm_connection_disconnect(sc)) != 0)
+		return (error);
+	if (sc->connection.taskq != NULL)
+		taskq_wait(sc->connection.taskq);
 	iwm_m_stop(sc);
 	if ((error = iwm_operation_enter(sc, IWM_OP_DETACH)) != 0)
 		return (error);
@@ -1197,6 +1314,10 @@ iwm_public_unregister(struct iwm_softc *sc)
 		sc->ic.ic_mach = NULL;
 	}
 	error = iwm_scan_detach(sc);
+	if (error == 0 && sc->connection.taskq != NULL) {
+		taskq_destroy(sc->connection.taskq);
+		sc->connection.taskq = NULL;
+	}
 out:
 	iwm_operation_exit(sc);
 	return (error);
@@ -1217,6 +1338,7 @@ iwm_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	sc->dip = dip;
 	mutex_init(&sc->operation_lock, NULL, MUTEX_DRIVER, NULL);
 	cv_init(&sc->operation_cv, NULL, CV_DRIVER, NULL);
+	cv_init(&sc->connection.cv, NULL, CV_DRIVER, NULL);
 	sc->operation_initialized = B_TRUE;
 	sc->public_enabled = ddi_prop_get_int(DDI_DEV_T_ANY, dip,
 	    DDI_PROP_DONTPASS, "iwm-public-scan", 0) != 0;

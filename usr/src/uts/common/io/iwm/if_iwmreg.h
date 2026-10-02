@@ -990,6 +990,184 @@ struct iwm_scan_v7 {
 	struct iwm_scan_umac_chan_param channel;
 } __attribute__((__packed__));
 
+/* API36 time-event v2 command and v1 response/notification. */
+#define	IWM_TIME_EVENT_CMD		0x29
+#define	IWM_TIME_EVENT_NOTIFICATION	0x2a
+#define	IWM_TE_BSS_STA_AGGRESSIVE_ASSOC	0
+#define	IWM_TE_HOST_START		0x0001
+#define	IWM_TE_HOST_END			0x0002
+#define	IWM_TE_START_IMMEDIATELY		0x0800
+#define	IWM_FW_CTXT_ACTION_ADD		1
+#define	IWM_FW_CTXT_ACTION_MODIFY	2
+#define	IWM_FW_CTXT_ACTION_REMOVE	3
+
+struct iwm_time_event_cmd {
+	uint32_t id_and_color;
+	uint32_t action;
+	uint32_t id;
+	uint32_t apply_time;
+	uint32_t max_delay;
+	uint32_t depends_on;
+	uint32_t interval;
+	uint32_t duration;
+	uint8_t repeat;
+	uint8_t max_frags;
+	uint16_t policy;
+} __attribute__((__packed__));
+
+struct iwm_time_event_resp {
+	uint32_t status;
+	uint32_t id;
+	uint32_t unique_id;
+	uint32_t id_and_color;
+} __attribute__((__packed__));
+
+struct iwm_time_event_notif {
+	uint32_t timestamp;
+	uint32_t session_id;
+	uint32_t unique_id;
+	uint32_t id_and_color;
+	uint32_t action;
+	uint32_t status;
+} __attribute__((__packed__));
+
+/* Legacy 8260 context layouts from the pinned donor. */
+struct iwm_phy_context_cmd {
+	uint32_t id_and_color;
+	uint32_t action;
+	uint32_t apply_time;
+	uint32_t tx_param_color;
+	uint8_t band;
+	uint8_t channel;
+	uint8_t width;
+	uint8_t ctrl_pos;
+	uint32_t txchain_info;
+	uint32_t rxchain_info;
+	uint32_t acquisition_data;
+	uint32_t dsp_cfg_flags;
+} __attribute__((__packed__));
+
+struct iwm_binding_cmd_v1 {
+	uint32_t id_and_color;
+	uint32_t action;
+	uint32_t macs[3];
+	uint32_t phy;
+} __attribute__((__packed__));
+
+struct iwm_mac_data_sta {
+	uint32_t is_assoc;
+	uint32_t dtim_time;
+	uint64_t dtim_tsf;
+	uint32_t bi;
+	uint32_t bi_reciprocal;
+	uint32_t dtim_interval;
+	uint32_t dtim_reciprocal;
+	uint32_t listen_interval;
+	uint32_t assoc_id;
+	uint32_t assoc_beacon_arrive_time;
+} __attribute__((__packed__));
+
+struct iwm_ac_qos {
+	uint16_t cw_min;
+	uint16_t cw_max;
+	uint8_t aifsn;
+	uint8_t fifos_mask;
+	uint16_t edca_txop;
+} __attribute__((__packed__));
+
+struct iwm_mac_ctx_cmd {
+	uint32_t id_and_color;
+	uint32_t action;
+	uint32_t mac_type;
+	uint32_t tsf_id;
+	uint8_t node_addr[6];
+	uint16_t reserved_for_node_addr;
+	uint8_t bssid_addr[6];
+	uint16_t reserved_for_bssid_addr;
+	uint32_t cck_rates;
+	uint32_t ofdm_rates;
+	uint32_t protection_flags;
+	uint32_t cck_short_preamble;
+	uint32_t short_slot;
+	uint32_t filter_flags;
+	uint32_t qos_flags;
+	struct iwm_ac_qos ac[5];
+	struct iwm_mac_data_sta sta;
+	/* Preserve the donor union's P2P-STA-sized tail; never enable P2P. */
+	uint32_t reserved;
+} __attribute__((__packed__));
+
+struct iwm_tx_path_flush_cmd_v1 {
+	uint32_t queues_ctl;
+	uint16_t flush_ctl;
+	uint16_t reserved;
+} __attribute__((__packed__));
+
+/* API36 legacy TX prefix. Offloads, encryption and aggregation stay zero. */
+struct iwm_tx_cmd {
+	uint16_t len;
+	uint16_t offload_assist;
+	uint32_t tx_flags;
+	uint32_t scratch;
+	uint32_t rate_n_flags;
+	uint8_t sta_id;
+	uint8_t sec_ctl;
+	uint8_t initial_rate_index;
+	uint8_t reserved2;
+	uint8_t key[16];
+	uint32_t reserved3;
+	uint32_t life_time;
+	uint32_t dram_lsb_ptr;
+	uint8_t dram_msb_ptr;
+	uint8_t rts_retry_limit;
+	uint8_t data_retry_limit;
+	uint8_t tid_tspec;
+	uint16_t pm_frame_timeout;
+	uint16_t reserved4;
+} __attribute__((__packed__));
+
+struct iwm_mac_power_cmd {
+	uint32_t id_and_color;
+	uint16_t flags;
+	uint16_t keep_alive_seconds;
+	uint32_t rx_data_timeout;
+	uint32_t tx_data_timeout;
+	uint32_t rx_data_timeout_uapsd;
+	uint32_t tx_data_timeout_uapsd;
+	uint8_t lprx_rssi_threshold;
+	uint8_t skip_dtim_periods;
+	uint16_t snooze_interval;
+	uint16_t snooze_window;
+	uint8_t snooze_step;
+	uint8_t qndp_tid;
+	uint8_t uapsd_ac_flags;
+	uint8_t uapsd_max_sp;
+	uint8_t heavy_tx_thld_packets;
+	uint8_t heavy_rx_thld_packets;
+	uint8_t heavy_tx_thld_percentage;
+	uint8_t heavy_rx_thld_percentage;
+	uint8_t limited_ps_threshold;
+	uint8_t reserved;
+} __attribute__((__packed__));
+
+struct iwm_time_quota_data {
+	uint32_t id_and_color;
+	uint32_t quota;
+	uint32_t max_duration;
+	uint32_t low_latency;
+} __attribute__((__packed__));
+
+CTASSERT(sizeof (struct iwm_phy_context_cmd) == 36);
+CTASSERT(sizeof (struct iwm_binding_cmd_v1) == 24);
+CTASSERT(sizeof (struct iwm_mac_data_sta) == 44);
+CTASSERT(sizeof (struct iwm_mac_ctx_cmd) == 148);
+CTASSERT(sizeof (struct iwm_tx_path_flush_cmd_v1) == 8);
+CTASSERT(sizeof (struct iwm_tx_cmd) == 56);
+CTASSERT(sizeof (struct iwm_mac_power_cmd) == 40);
+CTASSERT(sizeof (struct iwm_time_quota_data) == 16);
+CTASSERT(sizeof (struct iwm_time_event_cmd) == 36);
+CTASSERT(sizeof (struct iwm_time_event_resp) == 16);
+CTASSERT(sizeof (struct iwm_time_event_notif) == 24);
 CTASSERT(sizeof (struct iwm_scan_v7) == 48);
 CTASSERT(sizeof (struct iwm_add_sta_cmd) == 48);
 CTASSERT(sizeof (struct iwm_scd_txq_cfg_cmd) == 12);
