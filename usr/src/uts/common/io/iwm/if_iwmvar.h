@@ -152,8 +152,17 @@ struct iwm_dma_info {
 	boolean_t	bound;
 };
 
+/* Each streaming mapping holds a data-block reference until unbound. */
+struct iwm_tx_mapping {
+	ddi_dma_handle_t		handle;
+	mblk_t			*mp;
+	boolean_t		bound;
+};
+
 struct iwm_tx_data {
 	struct iwm_dma_info	dma;
+	struct iwm_tx_mapping	maps[IWM_NUM_OF_TBS - 2];
+	uint_t			mapped;
 	mblk_t			*mp;
 	struct ieee80211_node	*ni;
 	boolean_t		owned;
@@ -247,6 +256,7 @@ struct iwm_connection {
 	uint8_t essid[IEEE80211_NWID_LEN];
 	uint_t esslen;
 	uint_t channel;
+	uint16_t basic_rates;
 	uint_t parameters;
 	int error;
 	int cleanup_error;

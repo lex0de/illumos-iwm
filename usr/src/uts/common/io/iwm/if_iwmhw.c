@@ -424,6 +424,7 @@ struct iwm_association {
 	boolean_t mac;
 	boolean_t binding;
 	boolean_t station;
+	boolean_t run_configured;
 	uint_t queues;
 	struct iwm_tx_ring tx[4];
 	struct iwm_rx_phy_info rx_phy;
@@ -830,7 +831,7 @@ iwm_association_queues_check(struct iwm_runtime *r,
 					return (EPROTO);
 				owned++;
 			} else if (slot->mp != NULL || slot->ni != NULL ||
-			    slot->completed) {
+			    slot->completed || slot->mapped != 0) {
 				return (EPROTO);
 			}
 		}
@@ -2813,6 +2814,125 @@ iwm_association_tx_alloc(struct iwm_softc *sc)
 	return (0);
 }
 
+/* A failed unbind retains its data-block reference for stopped cleanup. */
+static int
+iwm_tx_unmap(struct iwm_tx_data *slot)
+{
+	while (slot->mapped != 0) {
+		struct iwm_tx_mapping *map = &slot->maps[slot->mapped - 1];
+
+		if (map->bound) {
+			if (ddi_dma_sync(map->handle, 0, 0,
+			    DDI_DMA_SYNC_FORCPU) != DDI_SUCCESS ||
+			    ddi_dma_unbind_handle(map->handle) != DDI_SUCCESS)
+				return (EIO);
+			map->bound = B_FALSE;
+		}
+		ddi_dma_free_handle(&map->handle);
+		freemsg(map->mp);
+		map->mp = NULL;
+		slot->mapped--;
+	}
+	return (0);
+}
+
+/* Fixed header stays in the command; map every payload block, without sleep. */
+static int
+iwm_tx_map(struct iwm_softc *sc, struct iwm_tx_data *slot, mblk_t *mp,
+    struct iwm_tfd *tfd)
+{
+	ddi_dma_attr_t attr = {
+		DMA_ATTR_V0, 0, 0xfffffffffULL, 0xfff, 1, 0x7ff, 1,
+		0xfff, 0xfffffffffULL, IWM_NUM_OF_TBS - 2, 1, 0
+	};
+	ddi_dma_cookie_t cookie;
+	struct iwm_tx_mapping *map;
+	size_t offset = 24, length, total;
+	uint_t count, i;
+	uint64_t address;
+
+	ASSERT(slot->mapped == 0);
+	tfd->num_tbs = 2;
+	for (; mp != NULL; mp = mp->b_cont, offset = 0) {
+		length = MBLKL(mp) - offset;
+		if (length == 0)
+			continue;
+		if (slot->mapped == IWM_NUM_OF_TBS - 2)
+			return (ENOBUFS);
+		map = &slot->maps[slot->mapped];
+		map->mp = dupb(mp);
+		if (map->mp == NULL)
+			return (ENOMEM);
+		if (ddi_dma_alloc_handle(sc->dip, &attr, DDI_DMA_DONTWAIT,
+		    NULL, &map->handle) != DDI_SUCCESS) {
+			freemsg(map->mp);
+			map->mp = NULL;
+			return (ENOMEM);
+		}
+		slot->mapped++;
+		if (ddi_dma_addr_bind_handle(map->handle, NULL,
+		    (caddr_t)mp->b_rptr + offset, length,
+		    DDI_DMA_WRITE | DDI_DMA_STREAMING, DDI_DMA_DONTWAIT,
+		    NULL, &cookie, &count) != DDI_DMA_MAPPED)
+			return (ENOBUFS);
+		map->bound = B_TRUE;
+		if (count == 0 || count >
+		    (uint_t)(IWM_NUM_OF_TBS - tfd->num_tbs))
+			return (ENOBUFS);
+		total = 0;
+		for (i = 0; i < count; i++) {
+			address = cookie.dmac_laddress;
+			if (cookie.dmac_size == 0 || cookie.dmac_size > 0xfff ||
+			    cookie.dmac_size > length - total ||
+			    address > 0xfffffffffULL || cookie.dmac_size - 1 >
+			    0xfffffffffULL - address)
+				return (EINVAL);
+			total += cookie.dmac_size;
+			tfd->tbs[tfd->num_tbs].lo = LE_32(address);
+			tfd->tbs[tfd->num_tbs++].hi_n_len = LE_16(
+			    (address >> 32) | (cookie.dmac_size << 4));
+			if (i + 1 < count)
+				ddi_dma_nextcookie(map->handle, &cookie);
+		}
+		if (total != length)
+			return (EINVAL);
+		if (ddi_dma_sync(map->handle, 0, 0,
+		    DDI_DMA_SYNC_FORDEV) != DDI_SUCCESS)
+			return (EIO);
+	}
+	return (0);
+}
+
+/* Whole MPDU bounds are independent of header contiguity and payload blocks. */
+static int
+iwm_tx_frame_check(mblk_t *mp, boolean_t management, size_t *length)
+{
+	static const uint8_t snap[] = { 0xaa, 0xaa, 3, 0, 0, 0 };
+	mblk_t *block;
+	const uint8_t *frame = mp->b_rptr;
+	uint_t fragments = 0;
+	size_t n;
+
+	*length = 0;
+	for (block = mp; block != NULL; block = block->b_cont) {
+		if (++fragments > IWM_RBUF_SIZE ||
+		    block->b_wptr < block->b_rptr)
+			return (EINVAL);
+		n = MBLKL(block);
+		if (n > IWM_RBUF_SIZE - *length)
+			return (EINVAL);
+		*length += n;
+	}
+	if (MBLKL(mp) < (management ? 24 : 32) || *length <= 24 ||
+	    (frame[0] & 0x0f) != (management ? 0 : 8) ||
+	    (frame[1] & 0x40) != 0 || (frame[0] & 0x80 && !management))
+		return (EINVAL);
+	if (!management && ((frame[1] & 3) != 1 ||
+	    bcmp(frame + 24, snap, sizeof (snap)) != 0))
+		return (EINVAL);
+	return (0);
+}
+
 /* Caller retains mp on error; the ring owns mp and its node after publish. */
 static int
 iwm_association_tx(struct iwm_softc *sc, mblk_t *mp, boolean_t management)
@@ -2823,23 +2943,22 @@ iwm_association_tx(struct iwm_softc *sc, mblk_t *mp, boolean_t management)
 	    { 10, 20, 55, 110, 13, 15, 5, 7, 9, 11, 1, 3 };
 	struct iwm_runtime *r;
 	struct iwm_tx_ring *ring;
-	struct iwm_tx_data *slot;
+	struct iwm_tx_data *slot = NULL;
 	struct iwm_device_cmd *cmd;
 	struct iwm_tx_cmd *tx;
 	struct iwm_tfd *tfd;
 	struct iwm_agn_scd_bc_tbl *bc;
 	ieee80211_node_t *node;
 	const uint8_t *frame = mp->b_rptr;
-	size_t length = MBLKL(mp);
+	size_t length;
 	uint64_t address, scratch;
 	uint32_t flags, rate_flags;
 	uint_t ac = management ? 3 : 0, i, j, selected = 12;
 	uint16_t bytes;
 	int error = EINVAL;
 
-	if (mp->b_cont != NULL || length <= 24 || length > IWM_RBUF_SIZE ||
-	    (frame[0] & 0x0f) != (management ? 0 : 8) ||
-	    (frame[1] & 0x40) != 0 || (frame[0] & 0x80 && !management))
+	if (iwm_tx_frame_check(mp, management, &length) != 0 ||
+	    (management && mp->b_cont != NULL))
 		return (EINVAL);
 	if (management && frame[0] != IEEE80211_FC0_SUBTYPE_AUTH &&
 	    frame[0] != IEEE80211_FC0_SUBTYPE_ASSOC_REQ &&
@@ -2863,7 +2982,8 @@ iwm_association_tx(struct iwm_softc *sc, mblk_t *mp, boolean_t management)
 	    !r->association.station)
 		goto out;
 	slot = &ring->data[ring->cur];
-	if (ring->queued >= IWM_TX_RING_COUNT - 1 || slot->owned) {
+	if (ring->queued >= IWM_TX_RING_COUNT - 1 || slot->owned ||
+	    slot->mapped != 0) {
 		error = EAGAIN;
 		goto out;
 	}
@@ -2871,10 +2991,9 @@ iwm_association_tx(struct iwm_softc *sc, mblk_t *mp, boolean_t management)
 	for (i = 0; i < node->in_rates.ir_nrates; i++) {
 		uint8_t rate = node->in_rates.ir_rates[i];
 
-		if (!(rate & IEEE80211_RATE_BASIC))
-			continue;
 		for (j = 0; j < sizeof (rates); j++) {
-			if ((rate & IEEE80211_RATE_VAL) == rates[j] &&
+			if ((sc->connection.basic_rates & (1U << j)) &&
+			    (rate & IEEE80211_RATE_VAL) == rates[j] &&
 			    (selected == 12 || rates[j] < rates[selected]))
 				selected = j;
 		}
@@ -2909,7 +3028,8 @@ iwm_association_tx(struct iwm_softc *sc, mblk_t *mp, boolean_t management)
 	tx->dram_lsb_ptr = LE_32(scratch);
 	tx->dram_msb_ptr = scratch >> 32;
 	bcopy(frame, cmd->data + sizeof (*tx), 24);
-	bcopy(frame + 24, slot->dma.vaddr, length - 24);
+	if (management)
+		bcopy(frame + 24, slot->dma.vaddr, length - 24);
 	tfd = &ring->desc[ring->cur];
 	bzero(tfd, sizeof (*tfd));
 	tfd->num_tbs = 3;
@@ -2919,9 +3039,14 @@ iwm_association_tx(struct iwm_softc *sc, mblk_t *mp, boolean_t management)
 	tfd->tbs[1].lo = LE_32(address);
 	tfd->tbs[1].hi_n_len = LE_16((address >> 32) |
 	    ((sizeof (cmd->hdr) + sizeof (*tx) + 24 - 16) << 4));
-	address = iwm_dma_addr(&slot->dma);
-	tfd->tbs[2].lo = LE_32(address);
-	tfd->tbs[2].hi_n_len = LE_16((address >> 32) | ((length - 24) << 4));
+	if (management) {
+		address = iwm_dma_addr(&slot->dma);
+		tfd->tbs[2].lo = LE_32(address);
+		tfd->tbs[2].hi_n_len = LE_16((address >> 32) |
+		    ((length - 24) << 4));
+	} else if ((error = iwm_tx_map(sc, slot, mp, tfd)) != 0) {
+		goto out;
+	}
 	bc = (void *)r->scheduler.vaddr;
 	bytes = length + IWM_TX_CRC_SIZE + IWM_TX_DELIMITER_SIZE;
 	if (sc->fw.flags & IWM_UCODE_TLV_FLAGS_DW_BC_TABLE)
@@ -2930,7 +3055,8 @@ iwm_association_tx(struct iwm_softc *sc, mblk_t *mp, boolean_t management)
 	if (ring->cur < IWM_TFD_QUEUE_SIZE_BC_DUP)
 		bc[ring->qid].tfd_offset[IWM_TFD_QUEUE_SIZE_MAX + ring->cur] =
 		    LE_16(bytes);
-	if (iwm_sync(&slot->dma, DDI_DMA_SYNC_FORDEV) != 0 ||
+	if ((management &&
+	    iwm_sync(&slot->dma, DDI_DMA_SYNC_FORDEV) != 0) ||
 	    iwm_sync(&ring->cmd_dma, DDI_DMA_SYNC_FORDEV) != 0 ||
 	    iwm_sync(&r->tx[ring->qid], DDI_DMA_SYNC_FORDEV) != 0 ||
 	    iwm_sync(&r->scheduler, DDI_DMA_SYNC_FORDEV) != 0) {
@@ -2952,6 +3078,11 @@ iwm_association_tx(struct iwm_softc *sc, mblk_t *mp, boolean_t management)
 	iwm_wr(sc, IWM_HBUS_TARG_WRPTR, ring->qid << 8 | ring->cur);
 	iwm_nic_unlock(sc);
 out:
+	if (error != 0 && slot != NULL && !slot->owned &&
+	    iwm_tx_unmap(slot) != 0) {
+		r->error = EIO;
+		cv_broadcast(&r->cv);
+	}
 	mutex_exit(&sc->lock);
 	return (error);
 }
@@ -2968,27 +3099,18 @@ iwm_connection_tx(struct iwm_softc *sc, mblk_t *mp)
 
 	while (mp != NULL) {
 		mutex_enter(&sc->lock);
-		if (!sc->connection.running || !sc->connection.tx_admission) {
+		if (!sc->connection.running || !sc->connection.tx_admission ||
+		    sc->connection.node == NULL) {
 			mutex_exit(&sc->lock);
 			return (mp);
 		}
 		node = ieee80211_ref_node(sc->connection.node);
 		mutex_exit(&sc->lock);
-		copy = msgpullup(mp, -1);
+		/* Copy the mutable header/LLC, retaining payload blocks. */
+		copy = msgpullup(mp, 32);
 		if (copy == NULL) {
 			ieee80211_free_node(node);
 			return (mp);
-		}
-		if (MBLKL(copy) < sizeof (struct ieee80211_frame) ||
-		    MBLKL(copy) > IWM_RBUF_SIZE) {
-			freemsg(copy);
-			ieee80211_free_node(node);
-			next = mp->b_next;
-			mp->b_next = NULL;
-			freemsg(mp);
-			mp = next;
-			atomic_inc_32(&sc->tx_rejected);
-			continue;
 		}
 		mutex_enter(&sc->ic.ic_genlock);
 		copy = ieee80211_encap(&sc->ic, copy, node);
@@ -3107,9 +3229,11 @@ iwm_association_quota(struct iwm_softc *sc, boolean_t running)
 	bzero(quota, sizeof (quota));
 	for (i = 0; i < 4; i++)
 		quota[i].id_and_color = LE_32(UINT32_MAX);
-	if (running) {
+	if (sc->run->association.binding) {
 		quota[0].id_and_color = 0;
-		quota[0].quota = LE_32(128);
+		quota[0].quota = LE_32(running ? 128 : 0);
+	} else if (running) {
+		return (EINVAL);
 	}
 	return (iwm_control(sc, 0x2c, quota, sizeof (quota)));
 }
@@ -3139,14 +3263,20 @@ iwm_association_sf(struct iwm_softc *sc, boolean_t running)
 static int
 iwm_association_run_stop(struct iwm_softc *sc)
 {
+	struct iwm_association *a = &sc->run->association;
 	int error;
 
+	if (!a->run_configured)
+		return (0);
 	if ((error = iwm_association_sf(sc, B_FALSE)) != 0 ||
 	    (error = iwm_association_quota(sc, B_FALSE)) != 0)
 		return (error);
 	/* Legacy power policy has no station PM or beacon filter to disable. */
-	return (iwm_association_mac(sc, IWM_FW_CTXT_ACTION_MODIFY,
-	    B_FALSE));
+	error = iwm_association_mac(sc, IWM_FW_CTXT_ACTION_MODIFY,
+	    B_FALSE);
+	if (error == 0)
+		a->run_configured = B_FALSE;
+	return (error);
 }
 
 /* No native RUN or public UP until all these commands have completed. */
@@ -3160,6 +3290,8 @@ iwm_association_run(struct iwm_softc *sc)
 	uint32_t keepalive;
 	int error;
 
+	/* Partial RUN updates also require RUN-stop before topology removal. */
+	a->run_configured = B_TRUE;
 	if ((error = iwm_association_station(sc, B_TRUE, B_FALSE)) != 0 ||
 	    (error = iwm_association_mac(sc, IWM_FW_CTXT_ACTION_MODIFY,
 	    B_TRUE)) != 0 ||
@@ -3210,8 +3342,13 @@ iwm_association_reclaim(struct iwm_softc *sc, boolean_t stopped)
 					error = ETIMEDOUT;
 				break;
 			}
-			if (iwm_sync(&slot->dma, DDI_DMA_SYNC_FORCPU) != 0)
+			if (slot->mapped != 0) {
+				if (iwm_tx_unmap(slot) != 0)
+					return (EIO);
+			} else if (iwm_sync(&slot->dma,
+			    DDI_DMA_SYNC_FORCPU) != 0) {
 				return (EIO);
+			}
 			mp = slot->mp;
 			node = slot->ni;
 			if (!stopped && sc->connection.tx_admission &&
@@ -3228,6 +3365,15 @@ iwm_association_reclaim(struct iwm_softc *sc, boolean_t stopped)
 			freemsg(mp);
 			ieee80211_free_node(node);
 			mutex_enter(&sc->lock);
+		}
+		/* Failed unbinds can retain unpublished block references. */
+		if (stopped) {
+			uint_t i;
+
+			for (i = 0; i < IWM_TX_RING_COUNT; i++) {
+				if (iwm_tx_unmap(&ring->data[i]) != 0)
+					return (EIO);
+			}
 		}
 	}
 	return (error);
@@ -4402,6 +4548,9 @@ iwm_connection_rollback(struct iwm_softc *sc)
 	}
 	if (error == 0)
 		error = iwm_unprotect_session(sc);
+	/* Quota and associated MAC state still refer to the live topology. */
+	if (error == 0)
+		error = iwm_association_run_stop(sc);
 	if (error == 0 && a->station) {
 		error = iwm_association_station(sc, B_TRUE, B_TRUE);
 		if (error == 0 && !iwm_command_version(&sc->fw, 0x1e, 1))
@@ -4439,16 +4588,12 @@ iwm_connection_rollback(struct iwm_softc *sc)
 			a->station = B_FALSE;
 	}
 	if (error == 0 && a->binding)
-		error = iwm_association_quota(sc, B_FALSE);
-	if (error == 0 && a->binding)
 		error = iwm_association_binding(sc, IWM_FW_CTXT_ACTION_REMOVE);
 	if (error == 0 && a->mac)
 		error = iwm_association_mac(sc, IWM_FW_CTXT_ACTION_REMOVE,
 		    B_FALSE);
 	if (error == 0 && a->phy)
 		error = iwm_association_phy(sc, IWM_FW_CTXT_ACTION_REMOVE);
-	if (error == 0)
-		error = iwm_association_sf(sc, B_FALSE);
 	if (error == 0)
 		error = iwm_queues_check(sc, "association-released");
 	if (nic)
@@ -4467,6 +4612,7 @@ stopped_cleanup:
 			a->tx[ac].configured = B_FALSE;
 		a->queues = 0;
 		a->station = a->binding = a->mac = a->phy = B_FALSE;
+		a->run_configured = B_FALSE;
 	}
 	for (i = 0; i < IWM_SCAN_RX_LIMIT; i++) {
 		if (a->frames[i].mp != NULL) {
@@ -4495,7 +4641,10 @@ iwm_connection_task(void *arg)
 	struct iwm_runtime *r;
 	struct iwm_scan_frame frame;
 	ieee80211_node_t *node = NULL;
+	static const uint8_t rates[] =
+	    { 2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108 };
 	clock_t tick;
+	uint_t i, j;
 	int error, cleanup = 0;
 
 	c->thread = curthread;
@@ -4504,6 +4653,18 @@ iwm_connection_task(void *arg)
 	if (error != 0)
 		goto done;
 	c->node = node;
+	/* Native ASSOC negotiation overwrites the AP's basic-rate bits. */
+	c->basic_rates = 0;
+	for (i = 0; i < node->in_rates.ir_nrates; i++) {
+		uint8_t rate = node->in_rates.ir_rates[i];
+
+		if (!(rate & IEEE80211_RATE_BASIC))
+			continue;
+		for (j = 0; j < sizeof (rates); j++) {
+			if ((rate & IEEE80211_RATE_VAL) == rates[j])
+				c->basic_rates |= 1U << j;
+		}
+	}
 	c->channel = ieee80211_chan2ieee(&sc->ic, node->in_chan);
 	error = iwm_runtime_acquire(sc, IWM_RUNTIME_CONNECT);
 	if (error != 0)
