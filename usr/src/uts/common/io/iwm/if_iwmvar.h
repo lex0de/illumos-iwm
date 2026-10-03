@@ -171,6 +171,7 @@ struct iwm_tx_ring {
 	struct iwm_tx_data	data[IWM_TX_RING_COUNT];
 	uint_t			qid;
 	boolean_t		configured;
+	boolean_t		released;
 	uint8_t			station;
 	uint8_t			fifo;
 	uint_t			queued;
@@ -234,6 +235,9 @@ struct iwm_connection {
 	kthread_t *thread;
 	ieee80211_node_t *node;
 	boolean_t pending;
+	boolean_t operation_owned;
+	boolean_t reassociating;
+	clock_t deadline;
 	boolean_t finished;
 	boolean_t cancel;
 	boolean_t running;

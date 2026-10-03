@@ -444,6 +444,8 @@ struct iwm_association {
 };
 
 struct iwm_runtime {
+	/* Disabled scheduler history outlives association storage. */
+	uint_t released_queues;
 	struct iwm_scan_state scan;
 	struct iwm_lar_state lar;
 	struct iwm_time_event_state protection;
@@ -807,7 +809,7 @@ iwm_association_queues_check(struct iwm_runtime *r,
 		    ring->queued >= IWM_TX_RING_COUNT)
 			return (EPROTO);
 		if (ring->configured) {
-			if (boundary != IWM_QUEUES_LIVE ||
+			if (boundary != IWM_QUEUES_LIVE || ring->released ||
 			    ring->qid == r->cmdqid ||
 			    (r->scan.aux_queue && ring->qid == IWM_AUX_QUEUE) ||
 			    (mask & (1U << ring->qid)) || ring->station != 0 ||
@@ -832,7 +834,9 @@ iwm_association_queues_check(struct iwm_runtime *r,
 				return (EPROTO);
 			}
 		}
-		if (owned != ring->queued ||
+		if ((ring->released && (ring->queued != 0 ||
+		    ring->cur != 0 || ring->tail != 0)) ||
+		    owned != ring->queued ||
 		    (ring->tail + owned) % IWM_TX_RING_COUNT != ring->cur)
 			return (EPROTO);
 	}
@@ -857,8 +861,9 @@ iwm_queues_check(struct iwm_softc *sc, const char *boundary)
 		uint_t ac;
 
 		for (ac = 0; ac < 4; ac++) {
-			if (r->association.tx[ac].configured &&
-			    r->association.tx[ac].qid == q)
+			if (r->association.tx[ac].qid != q)
+				continue;
+			if (r->association.tx[ac].configured)
 				ring = &r->association.tx[ac];
 		}
 		base = iwm_rd(sc, IWM_FH_MEM_CBBC_QUEUE(q));
@@ -881,6 +886,17 @@ iwm_queues_check(struct iwm_softc *sc, const char *boundary)
 			    (rd + IWM_TX_RING_COUNT - ring->tail) %
 			    IWM_TX_RING_COUNT > ring->queued)
 				error = EIO;
+			continue;
+		}
+		if (r->released_queues & (1U << q)) {
+			/* Disable leaves scheduler history, not live work. */
+			if (rd >= IWM_TX_RING_COUNT || wr != rd ||
+			    (status &
+			    (1U << IWM_SCD_QUEUE_STTS_REG_POS_ACTIVE)))
+				error = EIO;
+			dev_err(sc->dip, CE_NOTE, "!iwm %s released q%u "
+			    "rd=%08x wr=%08x status=%08x", boundary,
+			    q, rd, wr, status);
 			continue;
 		}
 		if (rd != 0 || wr != 0 ||
@@ -1523,6 +1539,7 @@ iwm_scan_softc(ieee80211com_t *ic)
 static int iwm_association_tx(struct iwm_softc *, mblk_t *, boolean_t);
 static int iwm_connection_state(struct iwm_softc *, enum ieee80211_state,
     int);
+static int iwm_connection_rollback(struct iwm_softc *);
 
 static int
 iwm_scan_xmit(ieee80211com_t *ic, mblk_t *mp, uint8_t type)
@@ -1996,7 +2013,8 @@ iwm_association_frame_check(const uint8_t *p, size_t n,
 	}
 	if (subtype == 0xa0 || subtype == 0xc0)
 		return (n >= 26 ? 0 : EPROTO);
-	if (subtype != 0x10 || state != IEEE80211_S_ASSOC || n < 30)
+	if ((subtype != 0x10 && subtype != 0x30) ||
+	    state != IEEE80211_S_ASSOC || n < 30)
 		return (ENOTSUP);
 	if (iwm_u16(p + 26) != 0)
 		return (EACCES);
@@ -2715,12 +2733,15 @@ iwm_association_queue(struct iwm_softc *sc, uint_t ac, boolean_t enable)
 	error = iwm_control(sc, 0x1d, &cmd, sizeof (cmd));
 	if (error == 0) {
 		a->tx[ac].configured = enable;
+		a->tx[ac].released = !enable;
 		a->tx[ac].station = cmd.sta_id;
 		a->tx[ac].fifo = cmd.tx_fifo;
 		if (enable) {
 			a->queues |= 1U << qid;
+			sc->run->released_queues &= ~(1U << qid);
 		} else {
 			a->queues &= ~(1U << qid);
+			sc->run->released_queues |= 1U << qid;
 			bzero(a->tx[ac].desc, sc->run->tx[qid].size);
 			a->tx[ac].cur = a->tx[ac].tail = 0;
 			error = iwm_sync(&sc->run->tx[qid],
@@ -2821,7 +2842,8 @@ iwm_association_tx(struct iwm_softc *sc, mblk_t *mp, boolean_t management)
 	    (frame[1] & 0x40) != 0 || (frame[0] & 0x80 && !management))
 		return (EINVAL);
 	if (management && frame[0] != IEEE80211_FC0_SUBTYPE_AUTH &&
-	    frame[0] != IEEE80211_FC0_SUBTYPE_ASSOC_REQ)
+	    frame[0] != IEEE80211_FC0_SUBTYPE_ASSOC_REQ &&
+	    frame[0] != IEEE80211_FC0_SUBTYPE_REASSOC_REQ)
 		return (ENOTSUP);
 	mutex_enter(&sc->lock);
 	r = sc->run;
@@ -3111,6 +3133,20 @@ iwm_association_sf(struct iwm_softc *sc, boolean_t running)
 		    (i == 2 ? 2016 : 320) : 160);
 	}
 	return (iwm_control(sc, 0xd1, command, sizeof (command)));
+}
+
+/* Donor RUN stop retains the legacy PHY/MAC/binding/station and queues. */
+static int
+iwm_association_run_stop(struct iwm_softc *sc)
+{
+	int error;
+
+	if ((error = iwm_association_sf(sc, B_FALSE)) != 0 ||
+	    (error = iwm_association_quota(sc, B_FALSE)) != 0)
+		return (error);
+	/* Legacy power policy has no station PM or beacon filter to disable. */
+	return (iwm_association_mac(sc, IWM_FW_CTXT_ACTION_MODIFY,
+	    B_FALSE));
 }
 
 /* No native RUN or public UP until all these commands have completed. */
@@ -4136,6 +4172,7 @@ iwm_connection_state(struct iwm_softc *sc, enum ieee80211_state state,
 	struct iwm_runtime *r = sc->run;
 	uint_t ac;
 	clock_t end;
+	enum ieee80211_state old;
 	int error = 0;
 
 	mutex_enter(&sc->lock);
@@ -4146,15 +4183,68 @@ iwm_connection_state(struct iwm_softc *sc, enum ieee80211_state state,
 		mutex_exit(&sc->lock);
 		return (ECANCELED);
 	}
+	old = sc->ic.ic_state;
+	if (old == IEEE80211_S_RUN && state != old &&
+	    !c->operation_owned) {
+		mutex_exit(&sc->lock);
+		error = iwm_operation_enter(sc, IWM_OP_CONNECT);
+		mutex_enter(&sc->lock);
+		if (error != 0)
+			goto failed;
+		c->operation_owned = B_TRUE;
+		if (c->cancel) {
+			error = ECANCELED;
+			goto failed;
+		}
+	}
+	if (old == IEEE80211_S_RUN && state != old) {
+		c->tx_admission = c->running = B_FALSE;
+		sc->associated_bssid_valid = B_FALSE;
+		bzero(sc->associated_bssid, sizeof (sc->associated_bssid));
+	}
+	if (state == IEEE80211_S_SCAN || state == IEEE80211_S_INIT) {
+		/* Honor native departure; no automatic AP selection or scan. */
+		c->tx_admission = c->rx_admission = B_FALSE;
+		c->cancel = B_TRUE;
+		mutex_exit(&sc->lock);
+		error = c->newstate(&sc->ic, state, arg);
+		mutex_enter(&sc->lock);
+		c->link_up = B_FALSE;
+		cv_broadcast(&r->cv);
+		mutex_exit(&sc->lock);
+		return (error);
+	}
 	if ((error = iwm_nic_lock(sc)) != 0) {
 		if (c->error == 0)
 			c->error = error;
 		mutex_exit(&sc->lock);
 		return (error);
 	}
+	if (old == IEEE80211_S_RUN && state != old) {
+		error = iwm_association_run_stop(sc);
+		if (error != 0) {
+			iwm_nic_unlock(sc);
+			goto failed;
+		}
+		if (state == IEEE80211_S_AUTH) {
+			/* Deauthentication needs fresh topology/protection. */
+			c->rx_admission = B_FALSE;
+			iwm_nic_unlock(sc);
+			error = iwm_connection_rollback(sc);
+			if (error != 0)
+				goto failed;
+			bzero(&r->protection, sizeof (r->protection));
+			mutex_exit(&sc->lock);
+			error = iwm_association_tx_alloc(sc);
+			mutex_enter(&sc->lock);
+			if (error != 0 ||
+			    (error = iwm_nic_lock(sc)) != 0)
+				goto failed;
+		}
+	}
 	switch (state) {
 	case IEEE80211_S_AUTH:
-		if (sc->ic.ic_state != IEEE80211_S_INIT) {
+		if (old != IEEE80211_S_INIT && old != IEEE80211_S_RUN) {
 			error = ECONNRESET;
 			break;
 		}
@@ -4173,15 +4263,23 @@ iwm_connection_state(struct iwm_softc *sc, enum ieee80211_state state,
 		if (error != 0 || (error = iwm_association_station(sc,
 		    B_FALSE, B_FALSE)) != 0)
 			break;
+		c->reassociating = B_FALSE;
+		c->deadline = ddi_get_lbolt() + drv_usectohz(5000000);
 		c->rx_admission = B_TRUE;
 		error = iwm_protect_session(sc, c->node->in_intval);
 		if (error == 0)
 			c->tx_admission = B_TRUE;
 		break;
 	case IEEE80211_S_ASSOC:
-		if (sc->ic.ic_state != IEEE80211_S_AUTH ||
-		    !r->protection.started || !r->protection.active)
+		if (old == IEEE80211_S_RUN) {
+			c->reassociating = B_TRUE;
+			c->deadline = ddi_get_lbolt() + drv_usectohz(5000000);
+			r->association.beacon_valid = B_FALSE;
+			c->tx_admission = B_TRUE;
+		} else if (old != IEEE80211_S_AUTH ||
+		    !r->protection.started || !r->protection.active) {
 			error = EPROTO;
+		}
 		break;
 	case IEEE80211_S_RUN:
 		if (sc->ic.ic_state != IEEE80211_S_ASSOC || c->running) {
@@ -4190,11 +4288,13 @@ iwm_connection_state(struct iwm_softc *sc, enum ieee80211_state state,
 		}
 		end = ddi_get_lbolt() + drv_usectohz(IWM_WAIT_US);
 		while (!r->association.beacon_valid && !c->cancel &&
-		    r->error == 0 && r->protection.active) {
+		    r->error == 0 &&
+		    (c->reassociating || r->protection.active)) {
 			if (cv_timedwait(&r->cv, &sc->lock, end) == -1)
 				break;
 		}
-		if (!r->association.beacon_valid || !r->protection.active) {
+		if (!r->association.beacon_valid ||
+		    (!c->reassociating && !r->protection.active)) {
 			error = ETIMEDOUT;
 			break;
 		}
@@ -4210,10 +4310,12 @@ iwm_connection_state(struct iwm_softc *sc, enum ieee80211_state state,
 	}
 	iwm_nic_unlock(sc);
 	if (error == 0 && state == IEEE80211_S_RUN &&
-	    r->protection.ended && !r->protection.removed)
+	    !c->reassociating && r->protection.ended &&
+	    !r->protection.removed)
 		error = ETIMEDOUT;
 	if (error == 0 && (c->cancel || r->error != 0))
 		error = c->cancel ? ECANCELED : r->error;
+failed:
 	if (error != 0) {
 		if (c->error == 0)
 			c->error = error;
@@ -4221,13 +4323,17 @@ iwm_connection_state(struct iwm_softc *sc, enum ieee80211_state state,
 		return (error);
 	}
 	mutex_exit(&sc->lock);
+	/* Native sta_leave publishes DOWN once, before its management TX. */
 	error = c->newstate(&sc->ic, state, arg);
 	mutex_enter(&sc->lock);
 	if (error == 0 && state == IEEE80211_S_RUN) {
 		c->running = c->link_up = B_TRUE;
+		c->reassociating = B_FALSE;
 		bcopy(c->node->in_bssid, sc->associated_bssid, 6);
 		sc->associated_bssid_valid = B_TRUE;
 	}
+	if (error == 0 && old == IEEE80211_S_RUN && state != old)
+		c->link_up = B_FALSE;
 	if (error != 0 && c->error == 0)
 		c->error = error;
 	mutex_exit(&sc->lock);
@@ -4389,11 +4495,11 @@ iwm_connection_task(void *arg)
 	struct iwm_runtime *r;
 	struct iwm_scan_frame frame;
 	ieee80211_node_t *node = NULL;
-	clock_t deadline, tick;
-	boolean_t operation_owned = B_TRUE;
+	clock_t tick;
 	int error, cleanup = 0;
 
 	c->thread = curthread;
+	c->operation_owned = B_TRUE;
 	error = iwm_select_bss(sc, c->essid, c->esslen, c->channel, &node);
 	if (error != 0)
 		goto done;
@@ -4416,26 +4522,29 @@ iwm_connection_task(void *arg)
 		goto teardown;
 	/* Native join consumes this extra reference; c->node owns the first. */
 	ieee80211_sta_join(&sc->ic, ieee80211_ref_node(node));
-	deadline = ddi_get_lbolt() + drv_usectohz(5000000);
 	tick = ddi_get_lbolt() + drv_usectohz(1000000);
 	mutex_enter(&sc->lock);
 	for (;;) {
 		error = iwm_association_reclaim(sc, B_FALSE);
 		if (error == 0)
 			error = c->error != 0 ? c->error : r->error;
-		if (error == 0 && c->cancel)
-			error = ECANCELED;
+		if (error == 0 && c->cancel) {
+			/* Explicit disconnect from RUN is normal completion. */
+			error = c->running ? 0 : ECANCELED;
+			break;
+		}
 		if (error == 0)
 			error = r->protection.error;
 		if (error == 0 && !c->running &&
-		    (r->protection.ended || ddi_get_lbolt() >= deadline))
+		    ((!c->reassociating && r->protection.ended &&
+		    !r->protection.removed) || ddi_get_lbolt() >= c->deadline))
 			error = ETIMEDOUT;
 		if (error != 0)
 			break;
-		if (c->running && operation_owned) {
+		if (c->running && c->operation_owned) {
 			mutex_exit(&sc->lock);
 			iwm_operation_exit(sc);
-			operation_owned = B_FALSE;
+			c->operation_owned = B_FALSE;
 			mutex_enter(&sc->lock);
 		}
 		if (r->association.queued != 0) {
@@ -4464,11 +4573,11 @@ iwm_connection_task(void *arg)
 	}
 	mutex_exit(&sc->lock);
 teardown:
-	if (!operation_owned) {
+	if (!c->operation_owned) {
 		cleanup = iwm_operation_enter(sc, IWM_OP_DISCONNECT);
 		if (cleanup != 0)
 			goto done;
-		operation_owned = B_TRUE;
+		c->operation_owned = B_TRUE;
 	}
 	mutex_enter(&sc->lock);
 	c->tx_admission = c->rx_admission = B_FALSE;
@@ -4501,8 +4610,10 @@ done:
 	mutex_exit(&sc->lock);
 	if (node != NULL)
 		ieee80211_free_node(node);
-	if (operation_owned)
+	if (c->operation_owned) {
 		iwm_operation_exit(sc);
+		c->operation_owned = B_FALSE;
+	}
 	dev_err(sc->dip, CE_NOTE, "!iwm connection error=%d cleanup=%d",
 	    error, cleanup);
 	mutex_enter(&sc->lock);
