@@ -170,6 +170,9 @@ struct iwm_tx_ring {
 	struct iwm_device_cmd	*cmd;
 	struct iwm_tx_data	data[IWM_TX_RING_COUNT];
 	uint_t			qid;
+	boolean_t		configured;
+	uint8_t			station;
+	uint8_t			fifo;
 	uint_t			queued;
 	uint_t			cur;
 	uint_t			tail;

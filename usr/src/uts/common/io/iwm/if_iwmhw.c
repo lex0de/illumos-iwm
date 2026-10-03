@@ -148,6 +148,10 @@
 #define	IWM_DQA_ENABLE_CMD	0x500
 #define	IWM_TEMP_THRESHOLDS_CMD	0x404
 #define	IWM_CAPA_CT_KILL_BY_FW	74
+#define	IWM_STATISTICS_NOTIFICATION	0x9d
+#define	IWM_API_NEW_RX_STATS	35
+/* API35 statistics v13: flags + RX + TX + general + load blocks. */
+#define	IWM_STATISTICS_V13_SIZE	(4 + 136 + 180 + 180 + 64)
 #define	IWM_PHY_DB_CFG	1
 #define	IWM_PHY_DB_CALIB_NCH	2
 #define	IWM_PHY_DB_CALIB_CHG_PAPD	4
@@ -200,8 +204,54 @@ enum iwm_proto_reason {
 	IWM_PROTO_NVM_SHORT, IWM_PROTO_RESPONSE_SIZE, IWM_PROTO_FH_TX,
 	IWM_PROTO_NVM_OFFSET, IWM_PROTO_NVM_STATUS,
 	IWM_PROTO_NVM_COUNT, IWM_PROTO_NVM_LENGTH, IWM_PROTO_NVM_ZERO,
-	IWM_PROTO_COMMAND_GROUP, IWM_PROTO_PHY_DB, IWM_PROTO_INIT_STATE
+	IWM_PROTO_COMMAND_GROUP, IWM_PROTO_PHY_DB, IWM_PROTO_INIT_STATE,
+	IWM_PROTO_NOTIFICATION
 };
+
+enum iwm_rx_class {
+	IWM_RX_RESPONSE, IWM_RX_ASYNC, IWM_RX_FRAME, IWM_RX_TX_DONE,
+	IWM_RX_UNSUPPORTED, IWM_RX_INVALID
+};
+
+/* Legacy sequence bit 15 distinguishes unsolicited firmware packets. */
+static enum iwm_rx_class
+iwm_rx_classify(uint_t code, uint_t qid)
+{
+	boolean_t unsolicited = (qid & 0x80) != 0;
+
+	switch (code) {
+	case 0xc0:	/* legacy RX PHY */
+	case 0xc1:	/* legacy RX MPDU */
+		return (unsolicited ? IWM_RX_FRAME : IWM_RX_INVALID);
+	case 0x1c:	/* ordinary station TX completion */
+		return (unsolicited ? IWM_RX_INVALID : IWM_RX_TX_DONE);
+	case IWM_INIT_COMPLETE_NOTIF:
+		return (IWM_RX_ASYNC);
+	case IWM_ALIVE:
+	case IWM_CALIB_RES_NOTIF_PHY_DB:
+	case IWM_MFUART_LOAD_NOTIFICATION:
+	case IWM_TIME_EVENT_NOTIFICATION:
+	case IWM_MCC_CHUB_UPDATE_CMD:
+	case IWM_STATISTICS_NOTIFICATION:
+	case 0x0f:	/* UMAC scan completion */
+	case 0xb5:	/* UMAC scan iteration */
+	case 0xa2:	/* missed beacons */
+	case 0xa1:	/* card state */
+	case 0x02:	/* firmware error */
+	case 0x4fe:	/* critical temperature */
+		return (unsolicited ? IWM_RX_ASYNC : IWM_RX_INVALID);
+	default:
+		return (unsolicited ? IWM_RX_UNSUPPORTED : IWM_RX_RESPONSE);
+	}
+}
+
+/* No statistics fields are consumed until their native reporting is needed. */
+static boolean_t
+iwm_statistics_check(uint32_t api, size_t length)
+{
+	return ((api & (1U << (IWM_API_NEW_RX_STATS % 32))) != 0 &&
+	    length == IWM_STATISTICS_V13_SIZE);
+}
 
 struct iwm_proto_diag {
 	enum iwm_proto_reason reason;
@@ -355,8 +405,12 @@ struct iwm_time_event_state {
 	boolean_t removing;
 	boolean_t removed;
 	uint32_t uid;
+	uint_t generation;
 	uint32_t id_color;
 	uint32_t response_status;
+	uint32_t remove_status;
+	uint32_t remove_id;
+	uint32_t remove_id_color;
 	uint32_t notification_status;
 	uint32_t notification_action;
 	uint32_t timestamp;
@@ -439,6 +493,13 @@ struct iwm_runtime {
 	uint_t generation;
 	uint_t expected_code;
 	boolean_t control_command;
+	enum iwm_rx_class packet_class;
+	uint_t statistics_notifications;
+	uint_t missed_beacon_notifications;
+	uint_t unsupported_notifications;
+	uint_t unsupported_code;
+	uint_t unsupported_sequence;
+	size_t unsupported_length;
 	boolean_t init_complete;
 	boolean_t calib_complete;
 	uint_t phy_notifications;
@@ -460,7 +521,8 @@ iwm_proto_report(struct iwm_softc *sc, const struct iwm_proto_diag *d)
 		"command-id", "no-command", "command-queue", "command-index",
 		"nvm-short", "response-size", "fh-tx-state", "nvm-offset",
 		"nvm-status", "nvm-count", "nvm-length",
-		"nvm-zero", "command-group", "phy-db", "init-state"
+		"nvm-zero", "command-group", "phy-db", "init-state",
+		"notification"
 	};
 
 	dev_err(sc->dip, CE_NOTE, "!iwm protocol reason=%s(%u) "
@@ -722,7 +784,62 @@ iwm_dma_addr(struct iwm_dma_info *dma)
 	return (dma->cookie.dmac_laddress);
 }
 
-/* No writes to unused queue producer pointers occur anywhere in this file. */
+enum iwm_queue_boundary {
+	IWM_QUEUES_LIVE,
+	IWM_QUEUES_RELEASED
+};
+
+/* Software ownership is checked even when device registers are inaccessible. */
+static int
+iwm_association_queues_check(struct iwm_runtime *r,
+    enum iwm_queue_boundary boundary)
+{
+	static const uint8_t fifo[] = { 1, 0, 2, 3 };
+	uint_t ac, i, mask = 0;
+
+	for (ac = 0; ac < 4; ac++) {
+		struct iwm_tx_ring *ring = &r->association.tx[ac];
+		uint_t owned = 0;
+
+		if (ring->qid >= IWM_MAX_QUEUES ||
+		    ring->cur >= IWM_TX_RING_COUNT ||
+		    ring->tail >= IWM_TX_RING_COUNT ||
+		    ring->queued >= IWM_TX_RING_COUNT)
+			return (EPROTO);
+		if (ring->configured) {
+			if (boundary != IWM_QUEUES_LIVE ||
+			    ring->qid == r->cmdqid ||
+			    (r->scan.aux_queue && ring->qid == IWM_AUX_QUEUE) ||
+			    (mask & (1U << ring->qid)) || ring->station != 0 ||
+			    ring->fifo != fifo[ac] || ring->desc == NULL ||
+			    !ring->cmd_dma.bound)
+				return (EPROTO);
+			mask |= 1U << ring->qid;
+		}
+		for (i = 0; i < IWM_TX_RING_COUNT; i++) {
+			struct iwm_tx_data *slot = &ring->data[i];
+
+			if (slot->owned) {
+				if (!ring->configured || slot->mp == NULL ||
+				    slot->ni == NULL || !slot->dma.bound ||
+				    slot->generation != r->generation ||
+				    (i + IWM_TX_RING_COUNT - ring->tail) %
+				    IWM_TX_RING_COUNT >= ring->queued)
+					return (EPROTO);
+				owned++;
+			} else if (slot->mp != NULL || slot->ni != NULL ||
+			    slot->completed) {
+				return (EPROTO);
+			}
+		}
+		if (owned != ring->queued ||
+		    (ring->tail + owned) % IWM_TX_RING_COUNT != ring->cur)
+			return (EPROTO);
+	}
+	return (mask == r->association.queues ? 0 : EPROTO);
+}
+
+/* Validate live owners before stop; RELEASED is checked after reclamation. */
 static int
 iwm_queues_check(struct iwm_softc *sc, const char *boundary)
 {
@@ -731,9 +848,19 @@ iwm_queues_check(struct iwm_softc *sc, const char *boundary)
 	uint32_t rd, wr, status, base;
 	int error = 0;
 
+	if (iwm_association_queues_check(r, IWM_QUEUES_LIVE) != 0)
+		return (EPROTO);
 	if (iwm_nic_lock(sc) != 0)
 		return (EBUSY);
 	for (q = 0; q < IWM_MAX_QUEUES; q++) {
+		struct iwm_tx_ring *ring = NULL;
+		uint_t ac;
+
+		for (ac = 0; ac < 4; ac++) {
+			if (r->association.tx[ac].configured &&
+			    r->association.tx[ac].qid == q)
+				ring = &r->association.tx[ac];
+		}
 		base = iwm_rd(sc, IWM_FH_MEM_CBBC_QUEUE(q));
 		if (base != iwm_dma_addr(&r->tx[q]) >> 8) {
 			error = EIO;
@@ -746,6 +873,16 @@ iwm_queues_check(struct iwm_softc *sc, const char *boundary)
 		status = iwm_prph_read(sc, IWM_SCD_QUEUE_STATUS_BITS(q));
 		if (q == r->cmdqid)
 			continue;
+		if (ring != NULL) {
+			if (!(status &
+			    (1U << IWM_SCD_QUEUE_STTS_REG_POS_ACTIVE)) ||
+			    (status & 7) != ring->fifo ||
+			    rd >= IWM_TX_RING_COUNT || wr != ring->cur ||
+			    (rd + IWM_TX_RING_COUNT - ring->tail) %
+			    IWM_TX_RING_COUNT > ring->queued)
+				error = EIO;
+			continue;
+		}
 		if (rd != 0 || wr != 0 ||
 		    ((status & (1 << IWM_SCD_QUEUE_STTS_REG_POS_ACTIVE)) &&
 		    !(r->scan.aux_queue && q == IWM_AUX_QUEUE))) {
@@ -1658,14 +1795,19 @@ iwm_time_event_response(struct iwm_time_event_state *t, const uint8_t *p,
     size_t n)
 {
 	if (t->removing) {
+		if (n == sizeof (struct iwm_time_event_resp)) {
+			t->remove_status = iwm_u32(p);
+			t->remove_id = iwm_u32(p + 4);
+			t->remove_id_color = iwm_u32(p + 12);
+		}
 		if (!t->accepted || t->removed ||
 		    n != sizeof (struct iwm_time_event_resp) ||
-		    iwm_u32(p) != 1 ||
-		    iwm_u32(p + 4) != IWM_TE_BSS_STA_AGGRESSIVE_ASSOC ||
-		    iwm_u32(p + 8) != t->uid ||
-		    iwm_u32(p + 12) != t->id_color)
+		    iwm_u32(p) != 0 ||
+		    iwm_u32(p + 8) != t->uid)
 			return (t->error = EPROTO);
+		/* REMOVE id/context are diagnostic; correlate only the UID. */
 		t->removed = B_TRUE;
+		t->removing = B_FALSE;
 		t->active = B_FALSE;
 		return (0);
 	}
@@ -1674,13 +1816,14 @@ iwm_time_event_response(struct iwm_time_event_state *t, const uint8_t *p,
 		return (t->error = EPROTO);
 	t->responded = B_TRUE;
 	t->response_status = iwm_u32(p);
-	t->uid = iwm_u32(p + 8);
-	if (iwm_u32(p + 4) != IWM_TE_BSS_STA_AGGRESSIVE_ASSOC ||
+	if (iwm_u32(p + 8) == 0 || iwm_u32(p + 8) == UINT32_MAX ||
+	    iwm_u32(p + 4) != IWM_TE_BSS_STA_AGGRESSIVE_ASSOC ||
 	    iwm_u32(p + 12) != t->id_color)
 		return (t->error = EPROTO);
-	/* Reviewed API36 policy: status 1 AND successful START before AUTH. */
-	if (t->response_status != 1)
+	/* Legacy command acceptance is distinct from notification success. */
+	if (t->response_status != 0)
 		return (t->error = EIO);
+	t->uid = iwm_u32(p + 8);
 	t->accepted = B_TRUE;
 	t->active = B_TRUE;
 	return (0);
@@ -1690,18 +1833,23 @@ static int
 iwm_time_event_notification(struct iwm_time_event_state *t,
     const uint8_t *p, size_t n, boolean_t regular)
 {
-	if (!regular || !t->submitted || !t->accepted || t->error != 0 ||
-	    n != sizeof (struct iwm_time_event_notif))
+	if (n != sizeof (struct iwm_time_event_notif))
+		return (t->error = EPROTO);
+	/* A retired event cannot affect work in another firmware generation. */
+	if (!regular && (t->removed || t->ended))
+		return (0);
+	if (!regular || !t->submitted || !t->accepted)
 		return (t->error = EPROTO);
 	t->timestamp = iwm_u32(p);
 	t->session = iwm_u32(p + 4);
 	t->notification_action = iwm_u32(p + 16);
 	t->notification_status = iwm_u32(p + 20);
 	if (iwm_u32(p + 8) != t->uid ||
-	    iwm_u32(p + 12) != t->id_color || t->ended)
+	    iwm_u32(p + 12) != t->id_color)
 		return (t->error = EPROTO);
 	if (t->notification_action == IWM_TE_HOST_START) {
-		if (t->started || t->removed)
+		if (t->started || t->ended || t->removed || t->removing ||
+		    t->error != 0)
 			return (t->error = EPROTO);
 		if (t->notification_status != 1)
 			return (t->error = EIO);
@@ -1709,7 +1857,8 @@ iwm_time_event_notification(struct iwm_time_event_state *t,
 	} else if (t->notification_action == IWM_TE_HOST_END) {
 		t->ended = B_TRUE;
 		t->active = B_FALSE;
-		if (!t->started || t->notification_status != 1)
+		if (!t->removed && (!t->started ||
+		    t->notification_status != 1))
 			return (t->error = EIO);
 	} else {
 		return (t->error = EPROTO);
@@ -1938,16 +2087,42 @@ drop:
 }
 
 static void
+iwm_unsupported_notification(struct iwm_softc *sc)
+{
+	struct iwm_runtime *r = sc->run;
+	struct iwm_proto_diag *d = &r->diagnostic;
+
+	r->unsupported_code = d->code;
+	r->unsupported_sequence = d->sequence;
+	r->unsupported_length = d->payload;
+	/* Retain the last packet; bound console output per runtime. */
+	if (r->unsupported_notifications++ < 8)
+		dev_err(sc->dip, CE_NOTE, "!iwm unsupported notification "
+		    "code=%04x sequence=%04x q=%u idx=%u length=%lu gen=%u",
+		    d->code, d->sequence, d->sequence >> 8,
+		    d->sequence & 0xff, (ulong_t)d->payload, r->generation);
+}
+
+/* Current DMA generation only, under sc->lock; stop drains before reuse. */
+static void
 iwm_notification(struct iwm_softc *sc, const uint8_t *p, size_t length)
 {
 	struct iwm_runtime *r = sc->run;
-	uint_t code = p[0] | (uint_t)p[1] << 8;
-	uint_t idx = p[2], qid = p[3];
-	const uint8_t *data = p + 4;
-	size_t n = length - 4;
+	uint_t code, idx, qid;
+	const uint8_t *data;
+	size_t n;
 	enum iwm_proto_reason reason;
 	struct iwm_proto_diag *d = &r->diagnostic;
 
+	if (length < 4) {
+		iwm_proto_error(sc, IWM_PROTO_RX_SHORT);
+		return;
+	}
+	code = p[0] | (uint_t)p[1] << 8;
+	idx = p[2];
+	qid = p[3];
+	data = p + 4;
+	n = length - 4;
 	d->packet_valid = B_TRUE;
 	d->code = code;
 	d->sequence = qid << 8 | idx;
@@ -1956,6 +2131,43 @@ iwm_notification(struct iwm_softc *sc, const uint8_t *p, size_t length)
 	    r->expected_code : IWM_NVM_ACCESS_CMD;
 	d->pending = r->command_pending;
 	d->payload = n;
+	r->packet_class = iwm_rx_classify(code, qid);
+	if (r->packet_class == IWM_RX_INVALID) {
+		iwm_proto_error(sc, IWM_PROTO_NOTIFICATION);
+		return;
+	}
+	if (r->packet_class == IWM_RX_UNSUPPORTED) {
+		iwm_unsupported_notification(sc);
+		return;
+	}
+	if (code == IWM_STATISTICS_NOTIFICATION) {
+		if (!iwm_statistics_check(sc->fw.api[IWM_API_NEW_RX_STATS / 32],
+		    n)) {
+			iwm_proto_error(sc, IWM_PROTO_NOTIFICATION);
+			return;
+		}
+		r->statistics_notifications++;
+		return;
+	}
+	if (code == 0xa2 || code == 0xa1 || code == 0x02 || code == 0x4fe) {
+		size_t expected = (code == 0xa2 || code == 0x02) ? 20 : 4;
+
+		if (n != expected) {
+			iwm_proto_error(sc, IWM_PROTO_NOTIFICATION);
+			return;
+		}
+		if (code == 0xa2)
+			r->missed_beacon_notifications++;
+		else if (code != 0xa1 || (iwm_u32(data) & 0xf) != 0)
+			r->error = EIO;
+		return;
+	}
+	if (code == 0xb5) {
+		/* UMAC v1 fixed header followed by scanned-channel records. */
+		if (n < 16 || n != 16 + (size_t)data[4] * 8)
+			iwm_proto_error(sc, IWM_PROTO_NOTIFICATION);
+		return;
+	}
 	if (sc->connection.pending && (code == 0xc0 || code == 0xc1)) {
 		iwm_association_rx(sc, code, data, n);
 		return;
@@ -1965,16 +2177,19 @@ iwm_notification(struct iwm_softc *sc, const uint8_t *p, size_t length)
 
 		if (error != 0 && r->error == 0)
 			r->error = error;
+		cv_broadcast(&r->cv);
 		return;
 	}
 
 	if (code == IWM_TIME_EVENT_NOTIFICATION) {
 		int error = iwm_time_event_notification(&r->protection, data, n,
 		    r->image == IWM_FW_REGULAR &&
-		    r->state == IWM_REGULAR_IDLE);
+		    r->state == IWM_REGULAR_IDLE &&
+		    r->protection.generation == r->generation &&
+		    (!r->cancel_requested || r->protection.removing));
 
-		if (r->error == 0)
-			r->error = error;
+		/* Event failure does not invalidate the command transport. */
+		(void) error;
 		cv_broadcast(&r->cv);
 		return;
 	}
@@ -2040,12 +2255,20 @@ iwm_notification(struct iwm_softc *sc, const uint8_t *p, size_t length)
 		return;
 	}
 	if (code == IWM_INIT_COMPLETE_NOTIF) {
+		/* Completion event; framed payload bytes are opaque. */
+		if (r->image == IWM_FW_INIT && r->init_complete)
+			return;
 		if (r->state != IWM_INIT_CALIBRATING ||
-		    r->image != IWM_FW_INIT || r->init_complete) {
+		    r->image != IWM_FW_INIT) {
 			iwm_proto_error(sc, IWM_PROTO_INIT_STATE);
 			return;
 		}
 		r->init_complete = B_TRUE;
+		return;
+	}
+	/* Inactive notifications cannot complete a command. */
+	if (r->packet_class != IWM_RX_RESPONSE) {
+		iwm_unsupported_notification(sc);
 		return;
 	}
 	if (r->control_command) {
@@ -2059,11 +2282,13 @@ iwm_notification(struct iwm_softc *sc, const uint8_t *p, size_t length)
 		bcopy(data, r->response, n);
 		r->response_len = n;
 		if (code == IWM_TIME_EVENT_CMD) {
-			int error = iwm_time_event_response(&r->protection,
-			    data, n);
-
-			if (r->error == 0)
-				r->error = error;
+			if (r->image != IWM_FW_REGULAR ||
+			    r->state != IWM_REGULAR_IDLE ||
+			    r->protection.generation != r->generation) {
+				iwm_proto_error(sc, IWM_PROTO_COMMAND_ID);
+				return;
+			}
+			(void) iwm_time_event_response(&r->protection, data, n);
 		}
 		r->command_done = B_TRUE;
 		return;
@@ -2168,6 +2393,8 @@ uint_t
 iwm_active_intr(struct iwm_softc *sc, uint32_t causes, uint32_t fh)
 {
 	struct iwm_runtime *r = sc->run;
+	boolean_t alive = r->alive, init_complete = r->init_complete;
+	boolean_t command_done = r->command_done, chunk_done = r->chunk_done;
 	uint32_t rx = IWM_CSR_INT_BIT_FH_RX | IWM_CSR_INT_BIT_SW_RX |
 	    IWM_CSR_INT_BIT_RX_PERIODIC;
 
@@ -2220,7 +2447,11 @@ iwm_active_intr(struct iwm_softc *sc, uint32_t causes, uint32_t fh)
 	if (r->error != 0)
 		r->mask = 0;
 	iwm_wr(sc, IWM_CSR_INT_MASK, r->mask);
-	cv_broadcast(&r->cv);
+	/* Routine notifications do not wake command/upload waiters. */
+	if (r->error != 0 || r->alive != alive ||
+	    r->init_complete != init_complete ||
+	    r->command_done != command_done || r->chunk_done != chunk_done)
+		cv_broadcast(&r->cv);
 	return (DDI_INTR_CLAIMED);
 }
 
@@ -2483,10 +2714,18 @@ iwm_association_queue(struct iwm_softc *sc, uint_t ac, boolean_t enable)
 	}
 	error = iwm_control(sc, 0x1d, &cmd, sizeof (cmd));
 	if (error == 0) {
-		if (enable)
+		a->tx[ac].configured = enable;
+		a->tx[ac].station = cmd.sta_id;
+		a->tx[ac].fifo = cmd.tx_fifo;
+		if (enable) {
 			a->queues |= 1U << qid;
-		else
+		} else {
 			a->queues &= ~(1U << qid);
+			bzero(a->tx[ac].desc, sc->run->tx[qid].size);
+			a->tx[ac].cur = a->tx[ac].tail = 0;
+			error = iwm_sync(&sc->run->tx[qid],
+			    DDI_DMA_SYNC_FORDEV);
+		}
 	}
 	return (error);
 }
@@ -2781,10 +3020,13 @@ iwm_protect_session(struct iwm_softc *sc, uint16_t beacon_interval)
 	cmd.policy = LE_16(IWM_TE_HOST_START | IWM_TE_HOST_END |
 	    IWM_TE_START_IMMEDIATELY);
 	/* Station MAC id/color is 0; firmware assigns the event UID. */
+	t->generation = r->generation;
 	t->submitted = B_TRUE;
 	error = iwm_control(sc, IWM_TIME_EVENT_CMD, &cmd, sizeof (cmd));
 	if (error != 0)
 		return (t->error = error);
+	if (t->error != 0)
+		return (t->error);
 	if (!t->responded || !t->accepted)
 		return (t->error = EPROTO);
 	/* TU is 1024us. The uint16_t interval bounds this addition. */
@@ -2825,7 +3067,7 @@ iwm_unprotect_session(struct iwm_softc *sc)
 	t->removing = B_TRUE;
 	error = iwm_control(sc, IWM_TIME_EVENT_CMD, &cmd, sizeof (cmd));
 	if (error == 0 && !t->removed)
-		error = EPROTO;
+		error = t->error != 0 ? t->error : EPROTO;
 	return (error);
 }
 
@@ -2936,7 +3178,8 @@ iwm_association_reclaim(struct iwm_softc *sc, boolean_t stopped)
 				return (EIO);
 			mp = slot->mp;
 			node = slot->ni;
-			if (!stopped && (slot->status & 0xff) != 1 &&
+			if (!stopped && sc->connection.tx_admission &&
+			    (slot->status & 0xff) != 1 &&
 			    (slot->status & 0xff) != 2 && mp->b_rptr[0] != 8)
 				error = EIO;
 			slot->mp = NULL;
@@ -2961,7 +3204,9 @@ iwm_association_free(struct iwm_softc *sc)
 	struct iwm_association *a = &sc->run->association;
 	uint_t ac, i;
 
-	ASSERT(sc->run->stopped || a->queues == 0);
+	if (iwm_association_queues_check(sc->run,
+	    IWM_QUEUES_RELEASED) != 0)
+		return (EPROTO);
 	for (ac = 0; ac < 4; ac++) {
 		ASSERT(a->tx[ac].queued == 0);
 		for (i = 0; i < IWM_TX_RING_COUNT; i++) {
@@ -3965,7 +4210,7 @@ iwm_connection_state(struct iwm_softc *sc, enum ieee80211_state state,
 	}
 	iwm_nic_unlock(sc);
 	if (error == 0 && state == IEEE80211_S_RUN &&
-	    r->protection.ended && !r->protection.removing)
+	    r->protection.ended && !r->protection.removed)
 		error = ETIMEDOUT;
 	if (error == 0 && (c->cancel || r->error != 0))
 		error = c->cancel ? ECANCELED : r->error;
@@ -4038,10 +4283,13 @@ iwm_connection_rollback(struct iwm_softc *sc)
 	uint32_t remove = 0;
 	uint_t ac, i, queued;
 	clock_t end;
-	int error = r->error;
+	int error = 0;
 	boolean_t nic = B_FALSE;
+	boolean_t transport_failed = r->error != 0;
 
 	ASSERT(MUTEX_HELD(&sc->lock));
+	if (transport_failed)
+		goto stopped_cleanup;
 	if (error == 0) {
 		error = iwm_nic_lock(sc);
 		nic = error == 0;
@@ -4061,8 +4309,10 @@ iwm_connection_rollback(struct iwm_softc *sc)
 	}
 	end = ddi_get_lbolt() + drv_usectohz(IWM_WAIT_US);
 	while (error == 0) {
-		/* Requested drain reclaims failed transmissions too. */
-		(void) iwm_association_reclaim(sc, B_FALSE);
+		/* Closed TX admission makes failed transmissions drainable. */
+		error = iwm_association_reclaim(sc, B_FALSE);
+		if (error != 0)
+			break;
 		queued = 0;
 		for (ac = 0; ac < 4; ac++)
 			queued += a->tx[ac].queued;
@@ -4093,9 +4343,12 @@ iwm_connection_rollback(struct iwm_softc *sc)
 		error = iwm_association_phy(sc, IWM_FW_CTXT_ACTION_REMOVE);
 	if (error == 0)
 		error = iwm_association_sf(sc, B_FALSE);
+	if (error == 0)
+		error = iwm_queues_check(sc, "association-released");
 	if (nic)
 		iwm_nic_unlock(sc);
-	if (error != 0) {
+stopped_cleanup:
+	if (error != 0 || transport_failed) {
 		/* Preserve the provider claim on this failed generation. */
 		if (r->error == 0)
 			r->error = error;
@@ -4103,6 +4356,11 @@ iwm_connection_rollback(struct iwm_softc *sc)
 			return (EIO);
 		if (iwm_association_reclaim(sc, B_TRUE) != 0)
 			return (EIO);
+		/* Reset ended device ownership, including partial topology. */
+		for (ac = 0; ac < 4; ac++)
+			a->tx[ac].configured = B_FALSE;
+		a->queues = 0;
+		a->station = a->binding = a->mac = a->phy = B_FALSE;
 	}
 	for (i = 0; i < IWM_SCAN_RX_LIMIT; i++) {
 		if (a->frames[i].mp != NULL) {
@@ -4167,6 +4425,8 @@ iwm_connection_task(void *arg)
 			error = c->error != 0 ? c->error : r->error;
 		if (error == 0 && c->cancel)
 			error = ECANCELED;
+		if (error == 0)
+			error = r->protection.error;
 		if (error == 0 && !c->running &&
 		    (r->protection.ended || ddi_get_lbolt() >= deadline))
 			error = ETIMEDOUT;
@@ -4281,6 +4541,9 @@ iwm_run_free(struct iwm_softc *sc)
 		}
 	}
 	r->association.queued = 0;
+	for (i = 0; i < 4; i++)
+		r->association.tx[i].configured = B_FALSE;
+	r->association.queues = 0;
 	mutex_exit(&sc->lock);
 	if (iwm_association_free(sc) != 0)
 		return (EIO);
