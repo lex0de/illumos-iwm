@@ -844,13 +844,22 @@ iwm_association_queues_check(struct iwm_runtime *r,
 	return (mask == r->association.queues ? 0 : EPROTO);
 }
 
+/* SCD register upper bits are not part of the legacy queue ring index. */
+static uint_t
+iwm_scd_queue_index(uint32_t raw)
+{
+	CTASSERT(IWM_TX_RING_COUNT != 0 &&
+	    (IWM_TX_RING_COUNT & (IWM_TX_RING_COUNT - 1)) == 0);
+	return (raw & (IWM_TX_RING_COUNT - 1));
+}
+
 /* Validate live owners before stop; RELEASED is checked after reclamation. */
 static int
 iwm_queues_check(struct iwm_softc *sc, const char *boundary)
 {
 	struct iwm_runtime *r = sc->run;
 	uint_t q, i;
-	uint32_t rd, wr, status, base;
+	uint32_t raw_rd, raw_wr, rd, wr, status, base;
 	int error = 0;
 
 	if (iwm_association_queues_check(r, IWM_QUEUES_LIVE) != 0)
@@ -874,8 +883,10 @@ iwm_queues_check(struct iwm_softc *sc, const char *boundary)
 			    "expected=%08x", boundary, q, base,
 			    (uint32_t)(iwm_dma_addr(&r->tx[q]) >> 8));
 		}
-		rd = iwm_prph_read(sc, IWM_SCD_QUEUE_RDPTR(q));
-		wr = iwm_prph_read(sc, IWM_SCD_QUEUE_WRPTR(q));
+		raw_rd = iwm_prph_read(sc, IWM_SCD_QUEUE_RDPTR(q));
+		raw_wr = iwm_prph_read(sc, IWM_SCD_QUEUE_WRPTR(q));
+		rd = iwm_scd_queue_index(raw_rd);
+		wr = iwm_scd_queue_index(raw_wr);
 		status = iwm_prph_read(sc, IWM_SCD_QUEUE_STATUS_BITS(q));
 		if (q == r->cmdqid)
 			continue;
@@ -883,7 +894,7 @@ iwm_queues_check(struct iwm_softc *sc, const char *boundary)
 			if (!(status &
 			    (1U << IWM_SCD_QUEUE_STTS_REG_POS_ACTIVE)) ||
 			    (status & 7) != ring->fifo ||
-			    rd >= IWM_TX_RING_COUNT || wr != ring->cur ||
+			    wr != ring->cur ||
 			    (rd + IWM_TX_RING_COUNT - ring->tail) %
 			    IWM_TX_RING_COUNT > ring->queued)
 				error = EIO;
@@ -891,13 +902,15 @@ iwm_queues_check(struct iwm_softc *sc, const char *boundary)
 		}
 		if (r->released_queues & (1U << q)) {
 			/* Disable leaves scheduler history, not live work. */
-			if (rd >= IWM_TX_RING_COUNT || wr != rd ||
+			if (wr != rd ||
 			    (status &
 			    (1U << IWM_SCD_QUEUE_STTS_REG_POS_ACTIVE)))
 				error = EIO;
 			dev_err(sc->dip, CE_NOTE, "!iwm %s released q%u "
-			    "rd=%08x wr=%08x status=%08x", boundary,
-			    q, rd, wr, status);
+			    "raw_rd=%08x raw_wr=%08x rd=%u wr=%u "
+			    "status=%08x active=%u", boundary, q,
+			    raw_rd, raw_wr, rd, wr, status,
+			    (status >> IWM_SCD_QUEUE_STTS_REG_POS_ACTIVE) & 1);
 			continue;
 		}
 		if (rd != 0 || wr != 0 ||
@@ -905,7 +918,8 @@ iwm_queues_check(struct iwm_softc *sc, const char *boundary)
 		    !(r->scan.aux_queue && q == IWM_AUX_QUEUE))) {
 			error = EIO;
 			dev_err(sc->dip, CE_WARN, "!iwm %s unused q%u "
-			    "rd=%08x wr=%08x status=%08x", boundary, q, rd,
+			    "raw_rd=%08x raw_wr=%08x rd=%u wr=%u "
+			    "status=%08x", boundary, q, raw_rd, raw_wr, rd,
 			    wr, status);
 		}
 		if (iwm_sync(&r->tx[q], DDI_DMA_SYNC_FORCPU) != 0)
@@ -1417,6 +1431,55 @@ iwm_scan_request(const struct iwm_scan_state *s, const uint8_t *mac,
 	return (0);
 }
 
+/*
+ * Only RSN/CCMP-128/PSK is supported. Validate complete lists and optional
+ * fields before passing an IE to native WPA or selecting a protected BSS.
+ * The caller owns p; no bytes or references are retained.
+ */
+int
+iwm_rsn_check(const uint8_t *p, size_t n)
+{
+	static const uint8_t ccmp[] = { 0, 0x0f, 0xac, 4 };
+	static const uint8_t psk[] = { 0, 0x0f, 0xac, 2 };
+	size_t off = 20, count;
+	uint16_t caps;
+
+	if (p == NULL || n < off || n > IEEE80211_MAX_WPA_IE ||
+	    p[0] != IEEE80211_ELEMID_RSN || p[1] != n - 2 ||
+	    iwm_u16(p + 2) != 1)
+		return (EPROTO);
+	if (bcmp(p + 4, ccmp, sizeof (ccmp)) || iwm_u16(p + 8) != 1 ||
+	    bcmp(p + 10, ccmp, sizeof (ccmp)) || iwm_u16(p + 14) != 1 ||
+	    bcmp(p + 16, psk, sizeof (psk)))
+		return (ENOTSUP);
+	if (off == n)
+		return (0);
+	if (n - off < 2)
+		return (EPROTO);
+	caps = iwm_u16(p + off);
+	/* No pairwise, required PMF or required SPP A-MSDU are unsupported. */
+	if (caps & ((1U << 1) | (1U << 6) | (1U << 11)))
+		return (ENOTSUP);
+	off += 2;
+	if (off == n)
+		return (0);
+	if (n - off < 2)
+		return (EPROTO);
+	count = iwm_u16(p + off);
+	off += 2;
+	if (count > (n - off) / 16)
+		return (EPROTO);
+	off += count * 16;
+	if (off == n)
+		return (0);
+	/* Optional BIP capability is not negotiated as PMF by this station. */
+	if (n - off != 4 || !(caps & (1U << 7)) ||
+	    p[off] != 0 || p[off + 1] != 0x0f ||
+	    p[off + 2] != 0xac || p[off + 3] != 6)
+		return (ENOTSUP);
+	return (0);
+}
+
 /* Complete TLVs and native parser field minima, before ieee80211_input. */
 static int
 iwm_scan_frame_check(const uint8_t *p, size_t n, uint_t channel)
@@ -1494,10 +1557,18 @@ iwm_select_bss(struct iwm_softc *sc, const uint8_t *essid, size_t length,
 		goto out;
 	error = ENOTSUP;
 	if ((node->in_capinfo & (IEEE80211_CAPINFO_ESS |
-	    IEEE80211_CAPINFO_IBSS | IEEE80211_CAPINFO_PRIVACY)) !=
-	    IEEE80211_CAPINFO_ESS || node->in_wpa_ie != NULL ||
+	    IEEE80211_CAPINFO_IBSS)) != IEEE80211_CAPINFO_ESS ||
 	    node->in_intval == 0)
 		goto out;
+	if (sc->connection.wpa) {
+		if (!(node->in_capinfo & IEEE80211_CAPINFO_PRIVACY) ||
+		    node->in_wpa_ie == NULL || iwm_rsn_check(node->in_wpa_ie,
+		    node->in_wpa_ie[1] + 2) != 0)
+			goto out;
+	} else if ((node->in_capinfo & IEEE80211_CAPINFO_PRIVACY) ||
+	    node->in_wpa_ie != NULL) {
+		goto out;
+	}
 	for (channel = 1; channel <= 13; channel++) {
 		if (node->in_chan == &sc->ic.ic_sup_channels[channel])
 			break;
@@ -1627,6 +1698,9 @@ iwm_scan_attach(struct iwm_softc *sc)
 	ic->ic_curmode = IEEE80211_MODE_11G;
 	ic->ic_maxrssi = 100;
 	ic->ic_xmit = iwm_scan_xmit;
+	/* AES-CCM hardware capability stays absent: native software crypto. */
+	if (sc->public_enabled)
+		ic->ic_caps = IEEE80211_C_WPA2;
 	bcopy(sc->identity.mac, ic->ic_macaddr, sizeof (ic->ic_macaddr));
 	ic->ic_sup_rates[IEEE80211_MODE_11B] = rates_b;
 	ic->ic_sup_rates[IEEE80211_MODE_11G] = rates_g;
@@ -1643,6 +1717,8 @@ iwm_scan_attach(struct iwm_softc *sc)
 	if (count == 0)
 		return (ENOENT);
 	ieee80211_attach(ic);
+	if (sc->public_enabled)
+		ieee80211_register_door(ic, "iwm", ddi_get_instance(sc->dip));
 	sc->connection.newstate = ic->ic_newstate;
 	sc->net_attached = B_TRUE;
 	if (sc->run != NULL)
@@ -1923,7 +1999,7 @@ iwm_association_tx_done(struct iwm_softc *sc, uint_t qid, uint_t idx,
 
 /* Native management parsers require complete, legacy-compatible IEs. */
 static int
-iwm_association_ies(const uint8_t *p, size_t n, size_t off)
+iwm_association_ies(const uint8_t *p, size_t n, size_t off, boolean_t wpa)
 {
 	size_t len;
 	uint_t nrates = 0;
@@ -1965,7 +2041,10 @@ iwm_association_ies(const uint8_t *p, size_t n, size_t off)
 			    (p[off + 6] == 1 && len != 24)))
 				return (EPROTO);
 		} else if (p[off] == 48) {
-			return (ENOTSUP);
+			if (!wpa)
+				return (ENOTSUP);
+			if (iwm_rsn_check(p + off, len + 2) != 0)
+				return (EPROTO);
 		}
 	}
 	return (rates ? 0 : EPROTO);
@@ -1975,12 +2054,12 @@ iwm_association_ies(const uint8_t *p, size_t n, size_t off)
 static int
 iwm_association_frame_check(const uint8_t *p, size_t n,
     const uint8_t *bssid, const uint8_t *local, uint_t channel,
-    enum ieee80211_state state)
+    enum ieee80211_state state, boolean_t wpa)
 {
 	uint_t subtype;
 	int error;
 
-	if (n < 24 || (p[0] & 3) != 0 || (p[1] & 0xc4) != 0 ||
+	if (n < 24 || (p[0] & 3) != 0 || (p[1] & 0x84) != 0 ||
 	    (iwm_u16(p + 22) & 15) != 0 || bcmp(p + 10, bssid, 6))
 		return (EPROTO);
 	if ((p[0] & 0x0c) == 8) {
@@ -1988,9 +2067,24 @@ iwm_association_frame_check(const uint8_t *p, size_t n,
 		    (p[1] & 3) != 2 || n < 32 ||
 		    (!(p[4] & 1) && bcmp(p + 4, local, 6)))
 			return (ENOTSUP);
+		if (p[1] & IEEE80211_FC1_WEP) {
+			if (!wpa || n < 24 + IEEE80211_WEP_HDRLEN +
+			    IEEE80211_WEP_EXTIVLEN + 8 + IEEE80211_WEP_MICLEN ||
+			    p[26] != 0 ||
+			    (p[27] & 0x3f) != IEEE80211_WEP_EXTIV ||
+			    (!(p[4] & 1) && (p[27] >> 6) != 0))
+				return (EPROTO);
+		} else if (wpa) {
+			static const uint8_t eapol[] =
+			    { 0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e };
+
+			/* Plaintext WPA input is restricted to EAPOL. */
+			if (bcmp(p + 24, eapol, sizeof (eapol)))
+				return (EACCES);
+		}
 		return (0);
 	}
-	if ((p[0] & 0x0c) != 0 || (p[1] & 3) != 0 ||
+	if ((p[0] & 0x0c) != 0 || (p[1] & 0x43) != 0 ||
 	    bcmp(p + 16, bssid, 6))
 		return (EPROTO);
 	subtype = p[0] & 0xf0;
@@ -2000,9 +2094,9 @@ iwm_association_frame_check(const uint8_t *p, size_t n,
 		error = iwm_scan_frame_check(p, n, channel);
 		if (error != 0)
 			return (error);
-		if ((iwm_u16(p + 34) & 0x13) != 1)
+		if ((iwm_u16(p + 34) & 0x13) != (wpa ? 0x11 : 1))
 			return (ENOTSUP);
-		return (iwm_association_ies(p, n, 36));
+		return (iwm_association_ies(p, n, 36, wpa));
 	}
 	if (bcmp(p + 4, local, 6))
 		return (EPROTO);
@@ -2019,11 +2113,11 @@ iwm_association_frame_check(const uint8_t *p, size_t n,
 		return (ENOTSUP);
 	if (iwm_u16(p + 26) != 0)
 		return (EACCES);
-	if ((iwm_u16(p + 24) & 0x13) != 1 ||
+	if ((iwm_u16(p + 24) & 0x13) != (wpa ? 0x11 : 1) ||
 	    (iwm_u16(p + 28) & 0x3fff) == 0 ||
 	    (iwm_u16(p + 28) & 0x3fff) > 2007)
 		return (EPROTO);
-	return (iwm_association_ies(p, n, 30));
+	return (iwm_association_ies(p, n, 30, wpa));
 }
 
 static void
@@ -2060,9 +2154,10 @@ iwm_association_rx(struct iwm_softc *sc, uint_t code,
 		goto drop;
 	p += 4;
 	error = iwm_association_frame_check(p, length, c->node->in_bssid,
-	    sc->identity.mac, channel, sc->ic.ic_state);
+	    sc->identity.mac, channel, sc->ic.ic_state, c->wpa);
 	if (error != 0) {
-		if (error == EACCES && c->error == 0)
+		if ((p[0] & IEEE80211_FC0_TYPE_MASK) ==
+		    IEEE80211_FC0_TYPE_MGT && error == EACCES && c->error == 0)
 			c->error = error;
 		goto drop;
 	}
@@ -2652,6 +2747,11 @@ iwm_association_mac(struct iwm_softc *sc, uint_t action, boolean_t assoc)
 		cmd.protection_flags = LE_32(1U << 3);
 	/* Receive beacons for native ERP/DTIM maintenance; no beacon filter. */
 	cmd.filter_flags = LE_32((1U << 2) | (1U << 6));
+	if (sc->connection.wpa) {
+		/* Preserve the full protected MPDU for native software CCMP. */
+		cmd.filter_flags |= LE_32(IWM_MAC_FILTER_DIS_DECRYPT |
+		    IWM_MAC_FILTER_DIS_GRP_DECRYPT);
+	}
 	for (i = 0; i < 4; i++) {
 		static const uint8_t fifo[] = { 1, 0, 2, 3 };
 		struct wmeParams *wme =
@@ -2925,11 +3025,25 @@ iwm_tx_frame_check(mblk_t *mp, boolean_t management, size_t *length)
 	}
 	if (MBLKL(mp) < (management ? 24 : 32) || *length <= 24 ||
 	    (frame[0] & 0x0f) != (management ? 0 : 8) ||
-	    (frame[1] & 0x40) != 0 || (frame[0] & 0x80 && !management))
+	    (management && (frame[1] & IEEE80211_FC1_WEP)) ||
+	    (frame[0] & 0x80 && !management))
 		return (EINVAL);
-	if (!management && ((frame[1] & 3) != 1 ||
-	    bcmp(frame + 24, snap, sizeof (snap)) != 0))
-		return (EINVAL);
+	if (!management) {
+		if ((frame[1] & 3) != 1)
+			return (EINVAL);
+		if (frame[1] & IEEE80211_FC1_WEP) {
+			/* SNAP is encrypted in a protected frame. */
+			if (mp->b_cont != NULL || *length < 24 +
+			    IEEE80211_WEP_HDRLEN + IEEE80211_WEP_EXTIVLEN +
+			    sizeof (struct ieee80211_llc) +
+			    IEEE80211_WEP_MICLEN ||
+			    frame[26] != 0 ||
+			    (frame[27] & 0x3f) != IEEE80211_WEP_EXTIV)
+				return (EINVAL);
+		} else if (bcmp(frame + 24, snap, sizeof (snap)) != 0) {
+			return (EINVAL);
+		}
+	}
 	return (0);
 }
 
@@ -3088,13 +3202,94 @@ out:
 }
 
 /*
- * MAC owns the returned suffix. A ring-accepted copy consumes its input.
+ * ic_genlock and crypto_lock are held. Consume the private header copy on
+ * conversion or failure; the framework's original chain is untouched. KCF
+ * CCMP requires one complete mblk, including cipher-provided MIC tailroom.
+ * reserved describes the MAC plugin's input, before native encap sets WEP.
  */
+static mblk_t *
+iwm_ccmp_prepare(struct iwm_softc *sc, mblk_t *mp, boolean_t reserved)
+{
+	static const uint8_t snap[] = { 0xaa, 0xaa, 3, 0, 0, 0 };
+	ieee80211com_t *ic = &sc->ic;
+	struct ieee80211_key *key;
+	const struct ieee80211_cipher *cipher;
+	mblk_t *block, *copy;
+	size_t total = 0, size, skip, offset, header;
+	uint_t fragments = 0;
+	boolean_t protected = (mp->b_rptr[1] & IEEE80211_FC1_WEP) != 0;
+
+	ASSERT(MUTEX_HELD(&ic->ic_genlock));
+	ASSERT(MUTEX_HELD(&sc->connection.crypto_lock));
+	if (!protected) {
+		/* Native pre-key EAPOL is clear; WPA data requires a key. */
+		if (MBLKL(mp) < 32 || bcmp(mp->b_rptr + 24, snap,
+		    sizeof (snap)) || mp->b_rptr[30] != 0x88 ||
+		    mp->b_rptr[31] != 0x8e)
+			goto failed;
+		return (mp);
+	}
+	if (!(ic->ic_flags & IEEE80211_F_WPA) ||
+	    ic->ic_def_txkey >= IEEE80211_WEP_NKID)
+		goto failed;
+	key = &ic->ic_nw_keys[ic->ic_def_txkey];
+	cipher = key->wk_cipher;
+	if (cipher->ic_cipher != IEEE80211_CIPHER_AES_CCM ||
+	    !(key->wk_flags & IEEE80211_KEY_SWCRYPT) ||
+	    !(key->wk_flags & IEEE80211_KEY_XMIT) ||
+	    key->wk_keytsc >= 0xffffffffffffULL)
+		goto failed;
+	header = ieee80211_hdrspace(ic, mp->b_rptr);
+	if (header != sizeof (struct ieee80211_frame))
+		goto failed;
+	for (block = mp; block != NULL; block = block->b_cont) {
+		if (++fragments > IWM_RBUF_SIZE ||
+		    block->b_wptr < block->b_rptr ||
+		    MBLKL(block) > IWM_RBUF_SIZE - total)
+			goto failed;
+		total += MBLKL(block);
+	}
+	skip = header + (reserved ? cipher->ic_header : 0);
+	if (total < skip + sizeof (struct ieee80211_llc))
+		goto failed;
+	size = total + (reserved ? 0 : cipher->ic_header);
+	if (size > IWM_RBUF_SIZE ||
+	    cipher->ic_trailer > IWM_RBUF_SIZE - size)
+		goto failed;
+	copy = allocb(size + cipher->ic_trailer, BPRI_MED);
+	if (copy == NULL)
+		goto failed;
+	bcopy(mp->b_rptr, copy->b_wptr, header);
+	copy->b_wptr += header;
+	bzero(copy->b_wptr, cipher->ic_header);
+	copy->b_wptr += cipher->ic_header;
+	for (block = mp; block != NULL; block = block->b_cont) {
+		offset = MIN(skip, MBLKL(block));
+		skip -= offset;
+		bcopy(block->b_rptr + offset, copy->b_wptr,
+		    MBLKL(block) - offset);
+		copy->b_wptr += MBLKL(block) - offset;
+	}
+	freemsg(mp);
+	if (MBLKL(copy) != size || bcmp(copy->b_rptr + header +
+	    cipher->ic_header, snap, sizeof (snap)) ||
+	    ieee80211_crypto_encap(ic, copy) == NULL) {
+		freemsg(copy);
+		return (NULL);
+	}
+	return (copy);
+failed:
+	freemsg(mp);
+	return (NULL);
+}
+
+/* MAC owns the returned suffix. A ring-accepted copy consumes its input. */
 mblk_t *
 iwm_connection_tx(struct iwm_softc *sc, mblk_t *mp)
 {
 	mblk_t *copy, *next;
 	ieee80211_node_t *node;
+	boolean_t reserved, allowed;
 	int error;
 
 	while (mp != NULL) {
@@ -3112,11 +3307,26 @@ iwm_connection_tx(struct iwm_softc *sc, mblk_t *mp)
 			ieee80211_free_node(node);
 			return (mp);
 		}
+		reserved = (copy->b_rptr[1] & IEEE80211_FC1_WEP) != 0;
+		mutex_enter(&sc->connection.crypto_lock);
 		mutex_enter(&sc->ic.ic_genlock);
-		copy = ieee80211_encap(&sc->ic, copy, node);
+		mutex_enter(&sc->lock);
+		allowed = sc->connection.running &&
+		    sc->connection.tx_admission && !sc->connection.cancel &&
+		    sc->connection.node == node;
+		mutex_exit(&sc->lock);
+		if (allowed) {
+			copy = ieee80211_encap(&sc->ic, copy, node);
+			if (copy != NULL && sc->connection.wpa)
+				copy = iwm_ccmp_prepare(sc, copy, reserved);
+		} else {
+			freemsg(copy);
+			copy = NULL;
+		}
 		mutex_exit(&sc->ic.ic_genlock);
 		error = copy == NULL ? ENOMEM :
 		    iwm_association_tx(sc, copy, B_FALSE);
+		mutex_exit(&sc->connection.crypto_lock);
 		ieee80211_free_node(node);
 		if (error != 0) {
 			if (copy != NULL)
@@ -3129,6 +3339,73 @@ iwm_connection_tx(struct iwm_softc *sc, mblk_t *mp)
 		mp = next;
 	}
 	return (NULL);
+}
+
+/*
+ * Thread context, no driver mutex held. Retire all native keys before node,
+ * topology or runtime destruction; TX preparation shares this exclusion.
+ */
+void
+iwm_connection_keys_clear(struct iwm_softc *sc)
+{
+	wl_del_key_t deletion = { 0 };
+	uint_t i;
+
+	if (!sc->net_attached)
+		return;
+	mutex_enter(&sc->connection.crypto_lock);
+	for (i = 0; i < IEEE80211_WEP_NKID; i++) {
+		deletion.idk_keyix = i;
+		(void) ieee80211_setprop(&sc->ic, "", MAC_PROP_WL_DELKEY,
+		    sizeof (deletion), &deletion);
+	}
+	mutex_enter(&sc->ic.ic_genlock);
+	sc->ic.ic_def_txkey = IEEE80211_KEYIX_NONE;
+	mutex_exit(&sc->ic.ic_genlock);
+	mutex_exit(&sc->connection.crypto_lock);
+}
+
+/* crypto_lock is held; management builders have stopped. */
+void
+iwm_connection_config_clear(struct iwm_softc *sc)
+{
+	wl_wpa_ie_t ie = { 0 };
+	wl_wpa_t wpa = { 0 };
+	wl_del_key_t deletion = { 0 };
+	struct iwm_connection *c = &sc->connection;
+	uint_t i;
+
+	ASSERT(MUTEX_HELD(&c->crypto_lock));
+	if (c->clear_ie) {
+		(void) ieee80211_setprop(&sc->ic, "", MAC_PROP_WL_SETOPTIE,
+		    sizeof (ie), &ie);
+		c->clear_ie = B_FALSE;
+		mutex_enter(&sc->lock);
+		sc->desired_bssid_valid = B_FALSE;
+		bzero(sc->desired_bssid, sizeof (sc->desired_bssid));
+		mutex_exit(&sc->lock);
+	}
+	if (c->disable_wpa) {
+		for (i = 0; i < IEEE80211_WEP_NKID; i++) {
+			deletion.idk_keyix = i;
+			(void) ieee80211_setprop(&sc->ic, "",
+			    MAC_PROP_WL_DELKEY, sizeof (deletion), &deletion);
+		}
+		(void) ieee80211_setprop(&sc->ic, "", MAC_PROP_WL_WPA,
+		    sizeof (wpa), &wpa);
+		mutex_enter(&sc->ic.ic_genlock);
+		sc->ic.ic_def_txkey = IEEE80211_KEYIX_NONE;
+		sc->ic.ic_des_esslen = 0;
+		bzero(sc->ic.ic_des_essid, sizeof (sc->ic.ic_des_essid));
+		mutex_exit(&sc->ic.ic_genlock);
+		mutex_enter(&sc->lock);
+		c->wpa = B_FALSE;
+		c->configuration = 0;
+		c->esslen = c->channel = 0;
+		bzero(c->essid, sizeof (c->essid));
+		mutex_exit(&sc->lock);
+		c->disable_wpa = B_FALSE;
+	}
 }
 
 /*
@@ -4348,8 +4625,17 @@ iwm_connection_state(struct iwm_softc *sc, enum ieee80211_state state,
 		sc->associated_bssid_valid = B_FALSE;
 		bzero(sc->associated_bssid, sizeof (sc->associated_bssid));
 	}
+	if (old == IEEE80211_S_RUN && state != old && c->wpa) {
+		mutex_exit(&sc->lock);
+		iwm_connection_keys_clear(sc);
+		mutex_enter(&sc->lock);
+	}
 	if (state == IEEE80211_S_SCAN || state == IEEE80211_S_INIT) {
 		/* Honor native departure; no automatic AP selection or scan. */
+		if (state == IEEE80211_S_SCAN && arg == -1 &&
+		    (old == IEEE80211_S_AUTH || old == IEEE80211_S_ASSOC) &&
+		    c->error == 0)
+			c->error = ETIMEDOUT;
 		c->tx_admission = c->rx_admission = B_FALSE;
 		c->cancel = B_TRUE;
 		mutex_exit(&sc->lock);
@@ -4410,7 +4696,6 @@ iwm_connection_state(struct iwm_softc *sc, enum ieee80211_state state,
 		    B_FALSE, B_FALSE)) != 0)
 			break;
 		c->reassociating = B_FALSE;
-		c->deadline = ddi_get_lbolt() + drv_usectohz(5000000);
 		c->rx_admission = B_TRUE;
 		error = iwm_protect_session(sc, c->node->in_intval);
 		if (error == 0)
@@ -4419,11 +4704,10 @@ iwm_connection_state(struct iwm_softc *sc, enum ieee80211_state state,
 	case IEEE80211_S_ASSOC:
 		if (old == IEEE80211_S_RUN) {
 			c->reassociating = B_TRUE;
-			c->deadline = ddi_get_lbolt() + drv_usectohz(5000000);
 			r->association.beacon_valid = B_FALSE;
 			c->tx_admission = B_TRUE;
 		} else if (old != IEEE80211_S_AUTH ||
-		    !r->protection.started || !r->protection.active) {
+		    !r->protection.started || r->protection.error != 0) {
 			error = EPROTO;
 		}
 		break;
@@ -4434,13 +4718,11 @@ iwm_connection_state(struct iwm_softc *sc, enum ieee80211_state state,
 		}
 		end = ddi_get_lbolt() + drv_usectohz(IWM_WAIT_US);
 		while (!r->association.beacon_valid && !c->cancel &&
-		    r->error == 0 &&
-		    (c->reassociating || r->protection.active)) {
+		    r->error == 0) {
 			if (cv_timedwait(&r->cv, &sc->lock, end) == -1)
 				break;
 		}
-		if (!r->association.beacon_valid ||
-		    (!c->reassociating && !r->protection.active)) {
+		if (!r->association.beacon_valid) {
 			error = ETIMEDOUT;
 			break;
 		}
@@ -4455,10 +4737,6 @@ iwm_connection_state(struct iwm_softc *sc, enum ieee80211_state state,
 		break;
 	}
 	iwm_nic_unlock(sc);
-	if (error == 0 && state == IEEE80211_S_RUN &&
-	    !c->reassociating && r->protection.ended &&
-	    !r->protection.removed)
-		error = ETIMEDOUT;
 	if (error == 0 && (c->cancel || r->error != 0))
 		error = c->cancel ? ECANCELED : r->error;
 failed:
@@ -4472,6 +4750,11 @@ failed:
 	/* Native sta_leave publishes DOWN once, before its management TX. */
 	error = c->newstate(&sc->ic, state, arg);
 	mutex_enter(&sc->lock);
+	if (error == 0 && (state == IEEE80211_S_AUTH ||
+	    state == IEEE80211_S_ASSOC)) {
+		/* Five native management ticks plus one scheduling tick. */
+		c->deadline = ddi_get_lbolt() + drv_usectohz(6000000);
+	}
 	if (error == 0 && state == IEEE80211_S_RUN) {
 		c->running = c->link_up = B_TRUE;
 		c->reassociating = B_FALSE;
@@ -4507,7 +4790,10 @@ iwm_connection_disconnect(struct iwm_softc *sc)
 	clock_t end = ddi_get_lbolt() + drv_usectohz(60000000);
 	int error = 0;
 
+	mutex_enter(&c->crypto_lock);
 	mutex_enter(&sc->lock);
+	c->resetting = B_TRUE;
+	mutex_exit(&c->crypto_lock);
 	if (c->pending) {
 		c->cancel = B_TRUE;
 		if (sc->run != NULL)
@@ -4522,6 +4808,14 @@ iwm_connection_disconnect(struct iwm_softc *sc)
 			error = c->cleanup_error;
 	}
 	mutex_exit(&sc->lock);
+	if (error == 0) {
+		mutex_enter(&c->crypto_lock);
+		/* Preparatory MLME reset does not call this public path. */
+		c->clear_ie = c->disable_wpa = B_TRUE;
+		iwm_connection_config_clear(sc);
+		c->resetting = B_FALSE;
+		mutex_exit(&c->crypto_lock);
+	}
 	return (error);
 }
 
@@ -4632,7 +4926,7 @@ stopped_cleanup:
 	return (error);
 }
 
-/* ESSID callback reserves CONNECT; this task owns all subsequent waits. */
+/* Open ESSID or WPA MLME reserves CONNECT; this task owns subsequent waits. */
 void
 iwm_connection_task(void *arg)
 {
@@ -4646,12 +4940,19 @@ iwm_connection_task(void *arg)
 	clock_t tick;
 	uint_t i, j;
 	int error, cleanup = 0;
+	boolean_t notify_disabled;
 
 	c->thread = curthread;
 	c->operation_owned = B_TRUE;
-	error = iwm_select_bss(sc, c->essid, c->esslen, c->channel, &node);
-	if (error != 0)
-		goto done;
+	/* WPA MLME already validated and transferred this referenced node. */
+	node = c->node;
+	error = 0;
+	if (node == NULL) {
+		error = iwm_select_bss(sc, c->essid, c->esslen, c->channel,
+		    &node);
+		if (error != 0)
+			goto done;
+	}
 	c->node = node;
 	/* Native ASSOC negotiation overwrites the AP's basic-rate bits. */
 	c->basic_rates = 0;
@@ -4696,9 +4997,17 @@ iwm_connection_task(void *arg)
 		}
 		if (error == 0)
 			error = r->protection.error;
+		if (error == 0 && ddi_get_lbolt() >= tick) {
+			mutex_exit(&sc->lock);
+			/* Run the native timeout before the fallback. */
+			ieee80211_watchdog(&sc->ic);
+			mac_tx_update(sc->ic.ic_mach);
+			mutex_enter(&sc->lock);
+			tick = ddi_get_lbolt() + drv_usectohz(1000000);
+			error = c->error != 0 ? c->error : r->error;
+		}
 		if (error == 0 && !c->running &&
-		    ((!c->reassociating && r->protection.ended &&
-		    !r->protection.removed) || ddi_get_lbolt() >= c->deadline))
+		    ddi_get_lbolt() >= c->deadline)
 			error = ETIMEDOUT;
 		if (error != 0)
 			break;
@@ -4722,14 +5031,6 @@ iwm_connection_task(void *arg)
 			mutex_enter(&sc->lock);
 			continue;
 		}
-		if (ddi_get_lbolt() >= tick) {
-			mutex_exit(&sc->lock);
-			/* Native state work stays in this thread. */
-			ieee80211_watchdog(&sc->ic);
-			mac_tx_update(sc->ic.ic_mach);
-			mutex_enter(&sc->lock);
-			tick = ddi_get_lbolt() + drv_usectohz(1000000);
-		}
 		(void) cv_timedwait(&r->cv, &sc->lock, tick);
 	}
 	mutex_exit(&sc->lock);
@@ -4747,7 +5048,23 @@ teardown:
 	bzero(sc->associated_bssid, sizeof (sc->associated_bssid));
 	mutex_exit(&sc->lock);
 	/* Native INIT publishes DOWN from RUN before resource removal. */
+	if (c->wpa)
+		iwm_connection_keys_clear(sc);
+	notify_disabled = B_FALSE;
+	mutex_enter(&c->crypto_lock);
+	if (c->mlme_cancel) {
+		mutex_enter(&sc->ic.ic_genlock);
+		notify_disabled = (sc->ic.ic_flags & IEEE80211_F_WPA) != 0;
+		sc->ic.ic_flags &= ~IEEE80211_F_WPA;
+		mutex_exit(&sc->ic.ic_genlock);
+	}
 	(void) c->newstate(&sc->ic, IEEE80211_S_INIT, 0);
+	if (notify_disabled) {
+		mutex_enter(&sc->ic.ic_genlock);
+		sc->ic.ic_flags |= IEEE80211_F_WPA;
+		mutex_exit(&sc->ic.ic_genlock);
+	}
+	mutex_exit(&c->crypto_lock);
 	c->link_up = B_FALSE;
 	mutex_enter(&sc->lock);
 	cleanup = iwm_connection_rollback(sc);
@@ -4777,12 +5094,19 @@ done:
 	}
 	dev_err(sc->dip, CE_NOTE, "!iwm connection error=%d cleanup=%d",
 	    error, cleanup);
+	mutex_enter(&c->crypto_lock);
+	if (c->wpa) {
+		/* A later MLME attempt must supply fresh RSN and BSSID. */
+		c->clear_ie = B_TRUE;
+		iwm_connection_config_clear(sc);
+	}
 	mutex_enter(&sc->lock);
 	c->pending = c->node != NULL;
 	c->thread = NULL;
 	c->finished = B_TRUE;
 	cv_broadcast(&c->cv);
 	mutex_exit(&sc->lock);
+	mutex_exit(&c->crypto_lock);
 }
 
 /* Attach/detach thread: runtime resources precede passive cleanup. */

@@ -625,6 +625,7 @@ iwm_cleanup(struct iwm_softc *sc)
 	iwm_pci_unmap(sc);
 	sc->csr_valid = B_FALSE;
 	if (sc->operation_initialized) {
+		mutex_destroy(&sc->connection.crypto_lock);
 		cv_destroy(&sc->connection.cv);
 		cv_destroy(&sc->operation_cv);
 		mutex_destroy(&sc->operation_lock);
@@ -934,6 +935,176 @@ iwm_ess_node(void *arg, struct ieee80211_node *node)
 	list->wl_ess_list_num++;
 }
 
+/* crypto_lock serializes the accumulated native configuration. */
+static boolean_t
+iwm_open_ready(struct iwm_softc *sc)
+{
+	struct iwm_connection *c = &sc->connection;
+	uint_t required = IWM_CONFIG_COMMON | IWM_CONFIG_OPEN;
+
+	return (!c->resetting && (c->configuration & required) == required &&
+	    !c->wpa &&
+	    !(sc->ic.ic_flags & IEEE80211_F_WPA) && sc->desired_bssid_valid);
+}
+
+static boolean_t
+iwm_wpa_ready(struct iwm_softc *sc)
+{
+	struct iwm_connection *c = &sc->connection;
+
+	return (!c->resetting &&
+	    (c->configuration & IWM_CONFIG_COMMON) == IWM_CONFIG_COMMON &&
+	    c->wpa && (sc->ic.ic_flags & IEEE80211_F_WPA) != 0 &&
+	    iwm_rsn_check((const uint8_t *)sc->ic.ic_opt_ie,
+	    sc->ic.ic_opt_ie_len) == 0);
+}
+
+/* Reserve only; the worker performs native join and firmware waits. */
+static int
+iwm_connect_request(struct iwm_softc *sc, const uint8_t *bssid)
+{
+	struct iwm_connection *c = &sc->connection;
+	ieee80211_node_t *node = NULL;
+	uint8_t previous[IEEE80211_ADDR_LEN];
+	boolean_t valid;
+	int error;
+
+	if ((error = iwm_operation_enter(sc, IWM_OP_CONNECT)) != 0)
+		return (error);
+	mutex_enter(&sc->lock);
+	if (c->pending || c->resetting || c->taskq == NULL ||
+	    sc->ic.ic_state != IEEE80211_S_INIT) {
+		error = EBUSY;
+		mutex_exit(&sc->lock);
+		goto out;
+	}
+	valid = sc->desired_bssid_valid;
+	bcopy(sc->desired_bssid, previous, sizeof (previous));
+	if (bssid != NULL) {
+		bcopy(bssid, sc->desired_bssid, IEEE80211_ADDR_LEN);
+		sc->desired_bssid_valid = B_TRUE;
+	}
+	mutex_exit(&sc->lock);
+	/* Reference the exact WPA node before scheduling anything. */
+	if (bssid != NULL && (error = iwm_select_bss(sc, c->essid,
+	    c->esslen, c->channel, &node)) != 0)
+		goto restore;
+	mutex_enter(&sc->lock);
+	c->node = node;
+	c->error = c->cleanup_error = 0;
+	c->cancel = c->mlme_cancel = B_FALSE;
+	c->clear_ie = c->disable_wpa = B_FALSE;
+	c->finished = B_FALSE;
+	c->pending = B_TRUE;
+	if (taskq_dispatch(c->taskq, iwm_connection_task, sc,
+	    TQ_NOSLEEP) == TASKQID_INVALID) {
+		c->pending = B_FALSE;
+		error = ENOMEM;
+	}
+	mutex_exit(&sc->lock);
+	if (error == 0)
+		return (0);
+restore:
+	mutex_enter(&sc->lock);
+	c->node = NULL;
+	bcopy(previous, sc->desired_bssid, sizeof (previous));
+	sc->desired_bssid_valid = valid;
+	mutex_exit(&sc->lock);
+	if (node != NULL)
+		ieee80211_free_node(node);
+out:
+	if (error != 0)
+		iwm_operation_exit(sc);
+	return (error);
+}
+
+/*
+ * Native key slots and set_tx semantics are preserved. Serialize key property
+ * calls against retirement without holding a MAC callback across firmware
+ * work. Reinstalling an identical live key must never reset its PN or RSC.
+ */
+static int
+iwm_wpa_key(struct iwm_softc *sc, const char *name, mac_prop_id_t id,
+    uint_t size, const void *value)
+{
+	ieee80211com_t *ic = &sc->ic;
+	wl_key_t key;
+	wl_del_key_t deletion;
+	struct ieee80211_key *live;
+	boolean_t duplicate = B_FALSE, allowed;
+	uint_t flags;
+	int error = 0;
+
+	if (id == MAC_PROP_WL_KEY) {
+		if (size != sizeof (key))
+			return (EINVAL);
+		bcopy(value, &key, sizeof (key));
+		flags = IEEE80211_KEY_XMIT | IEEE80211_KEY_RECV |
+		    IEEE80211_KEY_DEFAULT;
+		if (key.ik_type != IEEE80211_CIPHER_AES_CCM ||
+		    key.ik_keylen != IEEE80211_KEYBUF_SIZE ||
+		    key.ik_keyix >= IEEE80211_WEP_NKID ||
+		    key.ik_keyrsc > 0xffffffffffffULL ||
+		    (key.ik_flags != IEEE80211_KEY_RECV &&
+		    key.ik_flags != flags)) {
+			error = ENOTSUP;
+			goto out;
+		}
+	} else {
+		if (size != sizeof (deletion))
+			return (EINVAL);
+		bcopy(value, &deletion, sizeof (deletion));
+		if (deletion.idk_keyix >= IEEE80211_WEP_NKID)
+			return (EINVAL);
+	}
+	mutex_enter(&sc->connection.crypto_lock);
+	mutex_enter(&sc->lock);
+	allowed = sc->net_attached &&
+	    (id == MAC_PROP_WL_DELKEY || (sc->connection.wpa &&
+	    sc->connection.running && !sc->connection.cancel));
+	if (allowed && id == MAC_PROP_WL_KEY) {
+		if (key.ik_flags & IEEE80211_KEY_DEFAULT) {
+			allowed = key.ik_keyix == 0 &&
+			    bcmp(key.ik_macaddr, sc->associated_bssid, 6) == 0;
+		} else {
+			static const uint8_t zero[6] = { 0 };
+
+			/* Native receive-only GTK uses a zero address. */
+			allowed = key.ik_keyix != 0 &&
+			    bcmp(key.ik_macaddr, zero, sizeof (zero)) == 0;
+		}
+	}
+	mutex_exit(&sc->lock);
+	if (!allowed) {
+		error = EBUSY;
+		goto unlock;
+	}
+	if (id == MAC_PROP_WL_KEY) {
+		mutex_enter(&ic->ic_genlock);
+		live = &ic->ic_nw_keys[key.ik_keyix];
+		duplicate = live->wk_cipher->ic_cipher ==
+		    IEEE80211_CIPHER_AES_CCM &&
+		    live->wk_keylen == key.ik_keylen &&
+		    (live->wk_flags & IEEE80211_KEY_COMMON) ==
+		    (key.ik_flags & IEEE80211_KEY_COMMON) &&
+		    bcmp(live->wk_key, key.ik_keydata, key.ik_keylen) == 0;
+		if (duplicate) {
+			live->wk_keyrsc = MAX(live->wk_keyrsc, key.ik_keyrsc);
+			if (key.ik_flags & IEEE80211_KEY_DEFAULT)
+				ic->ic_def_txkey = key.ik_keyix;
+		}
+		mutex_exit(&ic->ic_genlock);
+	}
+	if (!duplicate)
+		error = ieee80211_setprop(ic, name, id, size, value);
+unlock:
+	mutex_exit(&sc->connection.crypto_lock);
+out:
+	/* This stack copy is never retained as diagnostic evidence. */
+	bzero(&key, sizeof (key));
+	return (error);
+}
+
 static int
 iwm_m_setprop(void *arg, const char *name, mac_prop_id_t id,
     uint_t size, const void *value)
@@ -946,40 +1117,119 @@ iwm_m_setprop(void *arg, const char *name, mac_prop_id_t id,
 	struct iwm_connection *c = &sc->connection;
 	const wl_essid_t *essid = value;
 	const wl_phy_conf_t *phy = value;
-	uint32_t scalar;
+	uint32_t scalar = 0;
 
-	_NOTE(ARGUNUSED(name))
 	if (value == NULL)
 		return (EINVAL);
+	if (id == MAC_PROP_WL_KEY || id == MAC_PROP_WL_DELKEY)
+		return (iwm_wpa_key(sc, name, id, size, value));
+	if (id == MAC_PROP_WL_MLME) {
+		wl_mlme_t mlme;
+
+		if (size != sizeof (mlme))
+			return (EINVAL);
+		bcopy(value, &mlme, sizeof (mlme));
+		if (mlme.im_op == IEEE80211_MLME_DISASSOC ||
+		    mlme.im_op == IEEE80211_MLME_DEAUTH) {
+			mutex_enter(&sc->lock);
+			if (c->pending) {
+				c->mlme_cancel = B_TRUE;
+				c->tx_admission = c->rx_admission = B_FALSE;
+			}
+			mutex_exit(&sc->lock);
+			iwm_connection_cancel(sc);
+			return (0);
+		}
+		for (i = 0; i < IEEE80211_ADDR_LEN; i++)
+			nonzero |= mlme.im_macaddr[i];
+		mutex_enter(&c->crypto_lock);
+		if (mlme.im_op != IEEE80211_MLME_ASSOC ||
+		    nonzero == 0 || (mlme.im_macaddr[0] & 1) != 0 ||
+		    !iwm_wpa_ready(sc))
+			error = EINVAL;
+		else
+			error = iwm_connect_request(sc, mlme.im_macaddr);
+		mutex_exit(&c->crypto_lock);
+		return (error);
+	}
+	if (id == MAC_PROP_WL_WPA || id == MAC_PROP_WL_SETOPTIE) {
+		const wl_wpa_ie_t *ie = value;
+		wl_wpa_t wpa = { 0 };
+
+		if (id == MAC_PROP_WL_WPA) {
+			if (size != sizeof (wpa))
+				return (EINVAL);
+			bcopy(value, &wpa, sizeof (wpa));
+			if (wpa.wpa_flag > 1)
+				return (ENOTSUP);
+		} else if (size < sizeof (*ie) ||
+		    ie->wpa_ie_len > IEEE80211_MAX_OPT_IE ||
+		    ie->wpa_ie_len > size - offsetof(wl_wpa_ie_t, wpa_ie) ||
+		    (ie->wpa_ie_len != 0 && iwm_rsn_check(
+		    (const uint8_t *)ie->wpa_ie, ie->wpa_ie_len) != 0)) {
+			return (EINVAL);
+		}
+		mutex_enter(&c->crypto_lock);
+		mutex_enter(&sc->lock);
+		if (c->pending && id == MAC_PROP_WL_SETOPTIE &&
+		    ie->wpa_ie_len == 0 && c->cancel) {
+			/* A management builder may still read the old IE. */
+			c->clear_ie = B_TRUE;
+			error = 0;
+		} else if (c->pending && id == MAC_PROP_WL_WPA &&
+		    wpa.wpa_flag == 0 && c->cancel) {
+			c->disable_wpa = B_TRUE;
+			error = 0;
+		} else if (c->pending || c->resetting) {
+			error = EBUSY;
+		} else {
+			error = 0;
+		}
+		mutex_exit(&sc->lock);
+		if (error == 0 && !c->pending) {
+			error = ieee80211_setprop(&sc->ic, name, id,
+			    size, value);
+			if (error == 0 && id == MAC_PROP_WL_WPA) {
+				c->wpa = wpa.wpa_flag != 0;
+				c->configuration &= ~IWM_CONFIG_OPEN;
+				if (!c->wpa) {
+					c->clear_ie = c->disable_wpa = B_TRUE;
+					iwm_connection_config_clear(sc);
+				}
+			}
+		}
+		mutex_exit(&c->crypto_lock);
+		return (error);
+	}
 	if (id == MAC_PROP_WL_ESSID) {
 		if (size != sizeof (*essid) || essid->wl_essid_length == 0 ||
 		    essid->wl_essid_length > IEEE80211_NWID_LEN)
 			return (EINVAL);
-		if ((error = iwm_operation_enter(sc, IWM_OP_CONNECT)) != 0)
+		mutex_enter(&c->crypto_lock);
+		if ((error = iwm_operation_enter(sc, IWM_OP_SELECT)) != 0) {
+			mutex_exit(&c->crypto_lock);
 			return (error);
-		mutex_enter(&sc->lock);
-		if (c->pending || !sc->desired_bssid_valid ||
-		    c->parameters != 7 || c->taskq == NULL ||
-		    sc->ic.ic_state != IEEE80211_S_INIT) {
+		}
+		if (c->pending || c->resetting) {
 			error = EBUSY;
 		} else {
+			mutex_enter(&sc->ic.ic_genlock);
+			bcopy(essid->wl_essid_essid, sc->ic.ic_des_essid,
+			    essid->wl_essid_length);
+			sc->ic.ic_des_esslen = essid->wl_essid_length;
+			mutex_exit(&sc->ic.ic_genlock);
+			mutex_enter(&sc->lock);
 			bcopy(essid->wl_essid_essid, c->essid,
 			    essid->wl_essid_length);
 			c->esslen = essid->wl_essid_length;
-			c->error = c->cleanup_error = 0;
-			c->cancel = B_FALSE;
-			c->finished = B_FALSE;
-			c->pending = B_TRUE;
-			/* Worker inherits the token, never this mutex. */
-			if (taskq_dispatch(c->taskq, iwm_connection_task, sc,
-			    TQ_NOSLEEP) == TASKQID_INVALID) {
-				c->pending = B_FALSE;
-				error = ENOMEM;
-			}
+			c->configuration |= IWM_CONFIG_ESSID;
+			mutex_exit(&sc->lock);
 		}
-		mutex_exit(&sc->lock);
-		if (error != 0)
-			iwm_operation_exit(sc);
+		iwm_operation_exit(sc);
+		/* WPA ESSID precedes wpad; only a pinned open path commits. */
+		if (error == 0 && iwm_open_ready(sc))
+			error = iwm_connect_request(sc, NULL);
+		mutex_exit(&c->crypto_lock);
 		return (error);
 	}
 	if (id == MAC_PROP_WL_ENCRYPTION || id == MAC_PROP_WL_AUTH_MODE ||
@@ -1010,19 +1260,29 @@ iwm_m_setprop(void *arg, const char *name, mac_prop_id_t id,
 			    (id == MAC_PROP_WL_BSSTYPE && scalar != WL_BSS_BSS))
 				return (ENOTSUP);
 		}
-		if ((error = iwm_operation_enter(sc, IWM_OP_SELECT)) != 0)
+		mutex_enter(&c->crypto_lock);
+		if ((error = iwm_operation_enter(sc, IWM_OP_SELECT)) != 0) {
+			mutex_exit(&c->crypto_lock);
 			return (error);
-		if (c->pending || !sc->net_attached)
+		}
+		mutex_enter(&sc->lock);
+		if (c->pending || c->resetting || !sc->net_attached)
 			error = EBUSY;
-		else if (id == MAC_PROP_WL_PHY_CONFIG)
+		else if (id == MAC_PROP_WL_PHY_CONFIG) {
 			c->channel = phy->wl_phy_dsss_conf.wl_dsss_channel;
-		else if (id == MAC_PROP_WL_ENCRYPTION)
-			c->parameters |= 1;
-		else if (id == MAC_PROP_WL_AUTH_MODE)
-			c->parameters |= 2;
+			c->configuration |= IWM_CONFIG_CHANNEL;
+		} else if (id == MAC_PROP_WL_ENCRYPTION) {
+			if (c->wpa)
+				error = EBUSY;
+			else
+				c->configuration |= IWM_CONFIG_OPEN;
+		} else if (id == MAC_PROP_WL_AUTH_MODE)
+			c->configuration |= IWM_CONFIG_AUTH;
 		else
-			c->parameters |= 4;
+			c->configuration |= IWM_CONFIG_BSSTYPE;
+		mutex_exit(&sc->lock);
 		iwm_operation_exit(sc);
+		mutex_exit(&c->crypto_lock);
 		return (error);
 	}
 	if (id != MAC_PROP_WL_BSSID)
@@ -1033,18 +1293,24 @@ iwm_m_setprop(void *arg, const char *name, mac_prop_id_t id,
 		nonzero |= address[i];
 	if (nonzero == 0 || (address[0] & 1) != 0)
 		return (EINVAL);
-	if ((error = iwm_operation_enter(sc, IWM_OP_SELECT)) != 0)
+	mutex_enter(&c->crypto_lock);
+	if ((error = iwm_operation_enter(sc, IWM_OP_SELECT)) != 0) {
+		mutex_exit(&c->crypto_lock);
 		return (error);
+	}
+	mutex_enter(&sc->lock);
 	if (!sc->net_attached || !sc->mac_registered)
 		error = ENXIO;
-	else if (c->pending || sc->associated_bssid_valid ||
+	else if (c->pending || c->resetting || sc->associated_bssid_valid ||
 	    (sc->runtime_owners & IWM_RUNTIME_CONNECT) != 0)
 		error = EBUSY;
 	else {
 		bcopy(address, sc->desired_bssid, IEEE80211_ADDR_LEN);
 		sc->desired_bssid_valid = B_TRUE;
 	}
+	mutex_exit(&sc->lock);
 	iwm_operation_exit(sc);
+	mutex_exit(&c->crypto_lock);
 	return (error);
 }
 
@@ -1058,13 +1324,19 @@ iwm_m_getprop(void *arg, const char *name, mac_prop_id_t id,
 	size_t used;
 	int error;
 
-	_NOTE(ARGUNUSED(name))
 	if (id == MAC_PROP_WL_BSSID) {
 		if (size < sizeof (wl_bssid_t))
 			return (ENOSPC);
 		mutex_enter(&sc->lock);
 		if (sc->associated_bssid_valid)
 			bcopy(sc->associated_bssid, value, sizeof (wl_bssid_t));
+		else if (sc->connection.wpa && sc->connection.pending &&
+		    sc->connection.node != NULL && !sc->connection.cancel &&
+		    sc->connection.tx_admission &&
+		    sc->ic.ic_state == IEEE80211_S_RUN)
+			/* Native RUN can queue EVENT_ASSOC before returning. */
+			bcopy(sc->connection.node->in_bssid, value,
+			    sizeof (wl_bssid_t));
 		else
 			bzero(value, sizeof (wl_bssid_t));
 		mutex_exit(&sc->lock);
@@ -1073,6 +1345,9 @@ iwm_m_getprop(void *arg, const char *name, mac_prop_id_t id,
 	if (id == MAC_PROP_WL_LINKSTATUS) {
 		if (size < sizeof (wl_linkstatus_t))
 			return (ENOSPC);
+		if (sc->connection.wpa)
+			return (ieee80211_getprop(&sc->ic, name, id,
+			    size, value));
 		mutex_enter(&sc->lock);
 		*(wl_linkstatus_t *)value = sc->connection.running ?
 		    WL_CONNECTED : WL_NOTCONNECTED;
@@ -1086,12 +1361,64 @@ iwm_m_getprop(void *arg, const char *name, mac_prop_id_t id,
 			return (ENOSPC);
 		bzero(essid, sizeof (*essid));
 		mutex_enter(&sc->lock);
-		if (sc->connection.running) {
+		if (sc->connection.configuration & IWM_CONFIG_ESSID) {
 			essid->wl_essid_length = sc->connection.esslen;
 			bcopy(sc->connection.essid, essid->wl_essid_essid,
 			    sc->connection.esslen);
 		}
 		mutex_exit(&sc->lock);
+		return (0);
+	}
+	if (id == MAC_PROP_WL_ENCRYPTION) {
+		if (size < sizeof (wl_encryption_t))
+			return (ENOSPC);
+		*(wl_encryption_t *)value = sc->connection.wpa ?
+		    WL_ENC_WPA : WL_NOENCRYPTION;
+		return (0);
+	}
+	if (id == MAC_PROP_WL_CAPABILITY || id == MAC_PROP_WL_WPA ||
+	    id == MAC_PROP_WL_RSSI) {
+		if (size < sizeof (uint32_t))
+			return (ENOSPC);
+		return (ieee80211_getprop(&sc->ic, name, id,
+			    size, value));
+	}
+	if (id == MAC_PROP_WL_SCANRESULTS) {
+		wl_wpa_ess_t *results = value;
+		struct wpa_ess *entry;
+		size_t count = 0, capacity;
+
+		if (size < offsetof(wl_wpa_ess_t, ess))
+			return (ENOSPC);
+		capacity = (size - offsetof(wl_wpa_ess_t, ess)) /
+		    sizeof (*entry);
+		results->count = 0;
+		mutex_enter(&sc->ic.ic_scan.nt_nodelock);
+		for (node = list_head(&sc->ic.ic_scan.nt_node); node != NULL;
+		    node = list_next(&sc->ic.ic_scan.nt_node, node)) {
+			if (node->in_chan == IEEE80211_CHAN_ANYC ||
+			    node->in_wpa_ie == NULL ||
+			    node->in_esslen > sizeof (entry->ssid) ||
+			    iwm_rsn_check(node->in_wpa_ie,
+			    node->in_wpa_ie[1] + 2) != 0)
+				continue;
+			if (count == capacity) {
+				mutex_exit(&sc->ic.ic_scan.nt_nodelock);
+				return (ENOSPC);
+			}
+			entry = &results->ess[count++];
+			bzero(entry, sizeof (*entry));
+			bcopy(node->in_bssid, entry->bssid,
+			    sizeof (entry->bssid));
+			entry->ssid_len = node->in_esslen;
+			bcopy(node->in_essid, entry->ssid, entry->ssid_len);
+			entry->freq = node->in_chan->ich_freq;
+			entry->wpa_ie_len = node->in_wpa_ie[1] + 2;
+			bcopy(node->in_wpa_ie, entry->wpa_ie,
+			    entry->wpa_ie_len);
+		}
+		mutex_exit(&sc->ic.ic_scan.nt_nodelock);
+		results->count = count;
 		return (0);
 	}
 	if (id != MAC_PROP_WL_ESS_LIST)
@@ -1140,12 +1467,17 @@ iwm_m_propinfo(void *arg, const char *name, mac_prop_id_t id,
 	_NOTE(ARGUNUSED(arg, name))
 	if (id == MAC_PROP_WL_BSSID || id == MAC_PROP_WL_ESSID ||
 	    id == MAC_PROP_WL_ENCRYPTION || id == MAC_PROP_WL_AUTH_MODE ||
-	    id == MAC_PROP_WL_BSSTYPE || id == MAC_PROP_WL_PHY_CONFIG) {
+	    id == MAC_PROP_WL_BSSTYPE || id == MAC_PROP_WL_PHY_CONFIG ||
+	    id == MAC_PROP_WL_WPA || id == MAC_PROP_WL_KEY ||
+	    id == MAC_PROP_WL_DELKEY || id == MAC_PROP_WL_SETOPTIE ||
+	    id == MAC_PROP_WL_MLME) {
 		mac_prop_info_set_perm(handle, MAC_PROP_PERM_RW);
 		return;
 	}
 	mac_prop_info_set_perm(handle,
-	    id == MAC_PROP_WL_LINKSTATUS || id == MAC_PROP_WL_ESS_LIST ?
+	    id == MAC_PROP_WL_LINKSTATUS || id == MAC_PROP_WL_ESS_LIST ||
+	    id == MAC_PROP_WL_CAPABILITY || id == MAC_PROP_WL_SCANRESULTS ||
+	    id == MAC_PROP_WL_RSSI ?
 	    MAC_PROP_PERM_READ : 0);
 }
 
@@ -1205,6 +1537,9 @@ iwm_m_ioctl(void *arg, queue_t *queue, mblk_t *mp)
 		else
 			error = iwm_public_scan(sc);
 		iwm_operation_exit(sc);
+		if (error == 0 && (sc->ic.ic_flags & IEEE80211_F_WPA))
+			/* Publish only after releasing SCAN serialization. */
+			ieee80211_end_scan(&sc->ic);
 	}
 	if (error != 0) {
 		miocnak(queue, mp, 0, error);
@@ -1303,6 +1638,9 @@ iwm_public_unregister(struct iwm_softc *sc)
 		error = EIO;
 		goto out;
 	}
+	if (sc->net_attached && (error = ieee80211_wpa_quiesce(&sc->ic,
+	    ddi_get_lbolt() + drv_usectohz(5000000))) != 0)
+		goto out;
 	if (sc->minor_created) {
 		ddi_remove_minor_node(sc->dip, NULL);
 		sc->minor_created = B_FALSE;
@@ -1339,6 +1677,7 @@ iwm_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	mutex_init(&sc->operation_lock, NULL, MUTEX_DRIVER, NULL);
 	cv_init(&sc->operation_cv, NULL, CV_DRIVER, NULL);
 	cv_init(&sc->connection.cv, NULL, CV_DRIVER, NULL);
+	mutex_init(&sc->connection.crypto_lock, NULL, MUTEX_DRIVER, NULL);
 	sc->operation_initialized = B_TRUE;
 	sc->public_enabled = ddi_prop_get_int(DDI_DEV_T_ANY, dip,
 	    DDI_PROP_DONTPASS, "iwm-public-scan", 0) != 0;

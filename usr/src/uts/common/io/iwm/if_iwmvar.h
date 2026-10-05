@@ -238,9 +238,19 @@ enum iwm_runtime_owner {
 };
 
 /* Persistent worker/selector state; transport belongs to the runtime. */
+#define	IWM_CONFIG_CHANNEL	0x01
+#define	IWM_CONFIG_AUTH		0x02
+#define	IWM_CONFIG_BSSTYPE	0x04
+#define	IWM_CONFIG_ESSID	0x08
+#define	IWM_CONFIG_OPEN		0x10
+#define	IWM_CONFIG_COMMON	(IWM_CONFIG_CHANNEL | IWM_CONFIG_AUTH | \
+	IWM_CONFIG_BSSTYPE | IWM_CONFIG_ESSID)
+
 struct iwm_connection {
 	taskq_t *taskq;
 	kcondvar_t cv;
+	/* Key properties and retirement: crypto_lock -> ic_genlock -> lock. */
+	kmutex_t crypto_lock;
 	kthread_t *thread;
 	ieee80211_node_t *node;
 	boolean_t pending;
@@ -253,11 +263,17 @@ struct iwm_connection {
 	boolean_t link_up;
 	boolean_t tx_admission;
 	boolean_t rx_admission;
+	/* Native WPA configuration enabled; ic_flags owns crypto semantics. */
+	boolean_t wpa;
+	boolean_t mlme_cancel;
+	boolean_t clear_ie;
+	boolean_t disable_wpa;
+	boolean_t resetting;
 	uint8_t essid[IEEE80211_NWID_LEN];
 	uint_t esslen;
 	uint_t channel;
 	uint16_t basic_rates;
-	uint_t parameters;
+	uint_t configuration;
 	int error;
 	int cleanup_error;
 	int (*newstate)(ieee80211com_t *, enum ieee80211_state, int);
@@ -353,6 +369,9 @@ void iwm_connection_task(void *);
 void iwm_connection_cancel(struct iwm_softc *);
 int iwm_connection_disconnect(struct iwm_softc *);
 mblk_t *iwm_connection_tx(struct iwm_softc *, mblk_t *);
+int iwm_rsn_check(const uint8_t *, size_t);
+void iwm_connection_keys_clear(struct iwm_softc *);
+void iwm_connection_config_clear(struct iwm_softc *);
 int iwm_runtime_stop(struct iwm_softc *);
 int iwm_public_scan(struct iwm_softc *);
 int iwm_select_bss(struct iwm_softc *, const uint8_t *, size_t, uint_t,

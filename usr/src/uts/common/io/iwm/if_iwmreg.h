@@ -1075,6 +1075,9 @@ struct iwm_ac_qos {
 	uint16_t edca_txop;
 } __attribute__((__packed__));
 
+#define	IWM_MAC_FILTER_DIS_DECRYPT	(1U << 3)
+#define	IWM_MAC_FILTER_DIS_GRP_DECRYPT	(1U << 4)
+
 struct iwm_mac_ctx_cmd {
 	uint32_t id_and_color;
 	uint32_t action;
